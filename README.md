@@ -308,4 +308,10 @@ src/storage.h/.cpp                 PlatformFolders based data directory and work
 src/syncresult.h/.cpp              structured result types
 src/reporting.h/.cpp               final report
 src/textutil.h/.cpp                small string helpers
+LICENSE.md                         MIT license text
 ```
+
+## 16. License
+
+Released under the MIT license. Copyright (c) 2026 d3fault <d3fault@d3fault.net> — see
+[LICENSE.md](LICENSE.md).
