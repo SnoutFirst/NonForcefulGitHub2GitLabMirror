@@ -41,6 +41,12 @@ class GitLabProjects {
   ProjectResult create(const GitHubRepository& repository, const std::string& slug,
                        const std::string& visibility) const;
 
+  /// Switch CI/CD off on a project created by this run (`PUT /projects/:id` with
+  /// `builds_access_level=disabled`). Called immediately after creation and never for a project
+  /// that already existed. Returns false and fills @p error when GitLab did not confirm the
+  /// change; the mirror itself continues either way.
+  bool disableCiCd(const std::string& pathWithNamespace, std::string& error) const;
+
   const ProcessRunner& runner_;
   std::string glabExecutable_;
   std::string namespace_;

@@ -155,6 +155,36 @@ GitLabProjects::Lookup GitLabProjects::lookUp(const std::string& pathWithNamespa
   return lookup;
 }
 
+bool GitLabProjects::disableCiCd(const std::string& pathWithNamespace, std::string& error) const {
+  // Equivalent to: glab api 'projects/<namespace>%2F<path>' --method PUT
+  //                        --raw-field builds_access_level=disabled
+  // The project is addressed by its URL-encoded full path, so the value stays valid even when the
+  // numeric project id is not cached.
+  const ProcessResult response =
+      runner_.run(glabExecutable_, {"api", "--method", "PUT",
+                                    "/projects/" + percentEncode(pathWithNamespace), "--raw-field",
+                                    "builds_access_level=disabled"});
+  if (!response.succeeded()) {
+    error = "CI/CD could not be disabled on the new project " + pathWithNamespace + ": " +
+            response.diagnostic();
+    return false;
+  }
+
+  boost::system::error_code parseError;
+  const boost::json::value document = boost::json::parse(response.standardOutput, parseError);
+  if (parseError || !document.is_object()) {
+    error = "cannot parse the GitLab response after disabling CI/CD on " + pathWithNamespace;
+    return false;
+  }
+  const std::string buildAccess = jsonString(document.get_object(), "builds_access_level");
+  if (!buildAccess.empty() && buildAccess != "disabled") {
+    error = "GitLab reports builds_access_level='" + buildAccess + "' for " + pathWithNamespace +
+            " even though it was set to disabled";
+    return false;
+  }
+  return true;
+}
+
 ProjectResult GitLabProjects::create(const GitHubRepository& repository, const std::string& slug,
                                      const std::string& visibility) const {
   ProjectResult result;
@@ -190,6 +220,16 @@ ProjectResult GitLabProjects::create(const GitHubRepository& repository, const s
     result.outcome = ProjectOutcome::failed;
     result.error = "GitLab created the project but the response lacks the repository URL";
     result.category = ErrorCategory::gitlabProject;
+    return result;
+  }
+
+  // The project was created by this run, so its CI/CD is switched off right away: the pushes that
+  // follow must not trigger pipelines. Settings of pre-existing projects are never touched.
+  std::string ciCdError;
+  if (disableCiCd(result.pathWithNamespace, ciCdError)) {
+    result.ciCdDisabled = true;
+  } else {
+    result.ciCdError = ciCdError;
   }
   return result;
 }

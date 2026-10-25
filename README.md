@@ -15,7 +15,8 @@ For every repository returned by the GitHub REST endpoint `/user/repos` with
 `affiliation=owner,collaborator,organization_member` (all pages, not just the first one):
 
 1. Resolve the destination GitLab project in the authenticated user's personal namespace, creating
-   it when it does not exist, with the visibility rule described below.
+   it when it does not exist, with the visibility rule described below — and switch CI/CD off on a
+   project that was just created.
 2. Locate or create a persistent **bare** Git repository as the synchronization workspace.
 3. Fetch every GitHub branch and every GitHub tag into a private source-tracking namespace
    (`refs/nonforceful-github/heads/*`, `refs/nonforceful-github/tags/*`).
@@ -46,6 +47,8 @@ These are invariants of the implementation, not options:
 * No shell is involved: `gh`, `glab` and `git` are launched as subprocesses with each argument passed
   separately, so repository names, URLs and ref names can never be re-interpreted by a shell.
 * A failing repository, branch or tag never aborts the run.
+* The only GitLab setting ever written is `builds_access_level=disabled`, and only on a project
+  this run created itself, immediately after creation. Existing projects are never reconfigured.
 
 ### What this means for mirror fidelity
 
@@ -205,6 +208,20 @@ makes the exit status nonzero.
   collision and skipped — their contents are never merged.
 * An existing project is verified to be the expected one (namespace and path) before anything is
   pushed to it.
+* A project **created by this run** has CI/CD disabled immediately after creation, before the first
+  ref is pushed. This is the equivalent of
+
+  ```
+  glab api 'projects/<namespace>%2F<project>' --method PUT --raw-field builds_access_level=disabled
+  ```
+
+  and it keeps the pushed branches from triggering pipelines. The response is checked, and a
+  project that GitLab does not report back with `builds_access_level=disabled` is reported as
+  `CI/CD: not disabled` with the reason. A failed CI/CD change never aborts the mirror — the refs are
+  still synchronized and the report states exactly what happened.
+* A project that **already existed** is never reconfigured: its CI/CD setting, visibility and every
+  other setting are left exactly as they are. The program only ever writes settings of a project it
+  created itself in the same run.
 
 ## 12. The final report
 
@@ -212,7 +229,7 @@ After every repository has been processed the program prints:
 
 * the absolute local data directory,
 * repositories discovered / synchronized / with failures / skipped,
-* GitLab projects created,
+* GitLab projects created, and how many of them had CI/CD disabled,
 * branches pushed (and how many were already up to date) and branch conflicts/failures,
 * tags pushed (and how many were already up to date) and tag conflicts/failures,
 * the number of name collisions,
@@ -256,7 +273,11 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
 * repository enumeration and JSON parsing, including a multi-page walk (verified separately with a
   reduced page size against the full 18-repository list; the code returned all 18 across four pages);
 * GitLab project creation in the personal namespace, with `private` → `private` and `public` →
-  `public`;
+  `public`, followed by `builds_access_level=disabled` on the new project;
+* the exact `glab` invocation used to disable CI/CD (`PUT /projects/<url-encoded path>` with
+  `--raw-field builds_access_level=disabled`) issued against an existing project on gitlab.com
+  (`SnoutFirst/glib`, already `disabled`, so no state changed) and confirmed to be accepted and
+  reflected in the response;
 * reuse of the local bare repositories on later runs (`reused`, refs up to date, exit status 0);
 * pushing two branches plus a lightweight and an annotated tag to each project;
 * a rewritten GitHub branch rejected as non-fast-forward and a moved GitHub tag rejected as a tag
@@ -278,7 +299,12 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
   have created and populated projects for every repository of the account, which is outside what
   unrequested test activity should do. Enumeration itself was verified against the complete list.
 * Ancillary GitLab features (protected branches, merge request settings, LFS, submodules) are not
-  handled; only refs are synchronized.
+  handled; only refs are synchronized. The single exception is `builds_access_level=disabled` on
+  projects created by the run.
+* Disabling CI/CD was verified with the exact `glab` invocation against an existing project whose
+  setting already was `disabled` (so nothing changed); it was not re-run against a freshly created
+  project during this verification pass, and the failure path (GitLab refusing the update) was not
+  provoked on a real instance.
 
 ## 14. Known limitations
 

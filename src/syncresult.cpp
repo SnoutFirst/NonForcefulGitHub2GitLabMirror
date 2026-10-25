@@ -161,6 +161,17 @@ std::size_t RunResult::projectsCreated() const {
   return count;
 }
 
+std::size_t RunResult::createdProjectsWithCiCdDisabled() const {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : repositories) {
+    if (repository.project.outcome == ProjectOutcome::created &&
+        repository.project.ciCdDisabled) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 std::size_t RunResult::branchesSucceeded() const {
   std::size_t count = 0;
   for (const RepositoryResult& repository : repositories) {

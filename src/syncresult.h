@@ -88,6 +88,11 @@ struct ProjectResult {
   std::string httpUrlToRepo;
   std::string visibility;
   bool visibilityMatchesRequirement = true;
+  /// True when CI/CD was switched off on a project created by this run
+  /// (`builds_access_level=disabled`). Existing projects are never modified.
+  bool ciCdDisabled = false;
+  /// Diagnostic when CI/CD could not be disabled on a newly created project.
+  std::string ciCdError;
   std::string error;
   ErrorCategory category = ErrorCategory::none;
 
@@ -141,6 +146,8 @@ struct RunResult {
   std::size_t tagsFailed() const;
   std::size_t tagsUpToDate() const;
   std::size_t collisions() const;
+  /// Newly created projects whose CI/CD was switched off (`builds_access_level=disabled`).
+  std::size_t createdProjectsWithCiCdDisabled() const;
 
   bool successful() const;
 };

@@ -30,6 +30,14 @@ void printRepositoryReport(std::ostream& stream, const RepositoryResult& result)
       stream << " " << result.project.webUrl;
     }
     stream << '\n';
+
+    if (result.project.outcome == ProjectOutcome::created) {
+      stream << "  CI/CD: " << (result.project.ciCdDisabled ? "disabled" : "not disabled");
+      if (!result.project.ciCdDisabled && !result.project.ciCdError.empty()) {
+        stream << " [" << result.project.ciCdError << ']';
+      }
+      stream << '\n';
+    }
   }
 
   if (result.localRepository.state != LocalRepositoryState::invalid) {
@@ -94,6 +102,8 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
   stream << "Repositories with failures: " << result.repositoriesWithFailures() << '\n';
   stream << "Repositories skipped: " << result.skippedRepositories() << '\n';
   stream << "GitLab projects created: " << result.projectsCreated() << '\n';
+  stream << "New projects with CI/CD disabled: " << result.createdProjectsWithCiCdDisabled()
+         << '\n';
   stream << "Branches pushed successfully: " << result.branchesSucceeded() << " (already up to date: "
          << result.branchesUpToDate() << ")\n";
   stream << "Branch conflicts/failures: " << result.branchesFailed() << '\n';
