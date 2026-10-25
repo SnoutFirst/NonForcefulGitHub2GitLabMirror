@@ -1,0 +1,217 @@
+#include "nonforcefulgithub2gitlabmirror.h"
+
+#include <exception>
+#include <iostream>
+
+#include "reporting.h"
+#include "textutil.h"
+
+namespace nfg2glm {
+
+int NonForcefulGitHub2GitLabMirror::run() {
+  std::cout << "NonForcefulGitHub2GitLabMirror\n"
+            << "One-way GitHub to GitLab mirror. Destination refs are never forced, "
+               "overwritten or deleted.\n\n";
+
+  if (!prepareStorage()) {
+    return 1;
+  }
+  std::cout << "Local data directory: " << result_.dataDirectory.string() << "\n\n";
+
+  if (!verifyPrerequisites()) {
+    std::cout << "\nAborting before synchronization: the required tooling or authentication "
+                 "is not usable.\n";
+    return 1;
+  }
+
+  std::cout << "\nDiscovering GitHub repositories...\n";
+  const DiscoveryResult discovery = discovery_->discover();
+  if (!discovery.ok) {
+    result_.discoveryComplete = false;
+    result_.discoveryError = discovery.error;
+    std::cout << "Repository discovery failed: " << discovery.error << "\n";
+    std::cout << "No repository was synchronized.\n";
+    printRunReport(std::cout, result_);
+    return 1;
+  }
+  if (!discovery.complete) {
+    result_.discoveryComplete = false;
+    result_.discoveryError = discovery.error;
+    std::cout << "Warning: repository discovery is incomplete: " << discovery.error << "\n";
+  }
+  std::cout << "Discovered " << discovery.repositories.size() << " repositories"
+            << " (" << discovery.duplicateEntries << " duplicate entries ignored, "
+            << discovery.malformedEntries << " unusable entries skipped).\n\n";
+
+  synchronize(discovery.repositories);
+  printRunReport(std::cout, result_);
+
+  if (!result_.successful()) {
+    std::cout << "\nResult: FAILED (see the report above)\n";
+    return 1;
+  }
+  std::cout << "\nResult: SUCCESS\n";
+  return 0;
+}
+
+bool NonForcefulGitHub2GitLabMirror::prepareStorage() {
+  try {
+    storage_ = std::make_unique<Storage>(Storage::defaultRoot());
+    storage_->ensureExists();
+  } catch (const std::exception& error) {
+    std::cerr << "error: " << error.what() << "\n";
+    storage_.reset();
+    return false;
+  }
+  result_.dataDirectory = storage_->root();
+  return true;
+}
+
+bool NonForcefulGitHub2GitLabMirror::verifyPrerequisites() {
+  const std::filesystem::path git = runner_.findExecutable("git");
+  const std::filesystem::path gh = runner_.findExecutable("gh");
+  const std::filesystem::path glab = runner_.findExecutable("glab");
+
+  const bool missing = git.empty() || gh.empty() || glab.empty();
+  if (git.empty()) {
+    std::cout << "error: the 'git' executable was not found on PATH\n";
+  }
+  if (gh.empty()) {
+    std::cout << "error: the 'gh' (GitHub CLI) executable was not found on PATH\n";
+  }
+  if (glab.empty()) {
+    std::cout << "error: the 'glab' (GitLab CLI) executable was not found on PATH\n";
+  }
+  if (missing) {
+    return false;
+  }
+
+  std::cout << "git:  " << git.string() << "\n"
+            << "gh:   " << gh.string() << "\n"
+            << "glab: " << glab.string() << "\n";
+
+  discovery_ = std::make_unique<GitHubDiscovery>(runner_, gh.string());
+  std::string account;
+  std::string error;
+  if (!discovery_->verifyAuthentication(account, error)) {
+    std::cout << "error: " << error << "\n";
+    return false;
+  }
+  std::cout << "Authenticated GitHub account: " << account << "\n";
+
+  projects_ = std::make_unique<GitLabProjects>(runner_, glab.string());
+  std::string namespacePath;
+  if (!projects_->verifyAuthentication(namespacePath, error)) {
+    std::cout << "error: " << error << "\n";
+    return false;
+  }
+  projects_->setNamespace(namespacePath);
+  std::cout << "Authenticated GitLab namespace: " << namespacePath << "\n";
+
+  workspace_ = std::make_unique<GitWorkspace>(runner_, git.string(), gh.string(),
+                                                            glab.string());
+  return true;
+}
+
+void NonForcefulGitHub2GitLabMirror::synchronize(
+    const std::vector<GitHubRepository>& repositories) {
+  std::size_t index = 0;
+  for (const GitHubRepository& repository : repositories) {
+    ++index;
+    std::cout << '[' << index << '/' << repositories.size() << "] " << repository.fullName
+              << " (" << repository.visibility << ")\n";
+
+    RepositoryResult result = synchronizeRepository(repository);
+    std::cout << "    -> " << describe(result.state) << ": " << result.branchesSucceeded()
+              << '/' << result.branches.size() << " branch(es), " << result.tagsSucceeded() << '/'
+              << result.tags.size() << " tag(s)";
+    if (!result.error.empty()) {
+      std::cout << " -- " << result.error;
+    }
+    std::cout << "\n";
+    result_.repositories.push_back(std::move(result));
+  }
+}
+
+RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
+    const GitHubRepository& repository) {
+  RepositoryResult result;
+  result.repository = repository;
+
+  try {
+    const std::string slug = GitLabProjects::projectSlug(repository.name);
+    const std::string pathKey = toLowerAscii(slug);
+    const auto claimed = projectPathOwners_.find(pathKey);
+    if (claimed != projectPathOwners_.end() &&
+        !equalsIgnoreCase(claimed->second, repository.fullName)) {
+      result.state = RepositoryState::skipped;
+      result.category = ErrorCategory::collision;
+      result.error = "the GitLab project path '" + slug + "' already mirrors " + claimed->second +
+                     "; this repository was skipped instead of merging the two";
+      return result;
+    }
+
+    result.project = projects_->ensureProject(repository);
+    if (!result.project.ok()) {
+      result.state = RepositoryState::failed;
+      result.category = result.project.category;
+      result.error = result.project.error;
+      return result;
+    }
+    projectPathOwners_[pathKey] = repository.fullName;
+    if (!result.project.visibilityMatchesRequirement) {
+      result.notes.push_back(result.project.error);
+    }
+
+    const std::filesystem::path repositoryPath = storage_->repositoryPath(repository);
+    result.localRepository =
+        workspace_->prepare(repository, repositoryPath, result.project.httpUrlToRepo);
+    if (!result.localRepository.ok()) {
+      result.state = RepositoryState::skipped;
+      result.category = result.localRepository.category;
+      result.error = result.localRepository.error;
+      return result;
+    }
+
+    result.fetch = workspace_->fetchAll(repository, repositoryPath);
+    if (!result.fetch.ok()) {
+      result.state = RepositoryState::failed;
+      result.category = result.fetch.category;
+      result.error = result.fetch.error;
+      return result;
+    }
+
+    for (const std::string& branch : result.fetch.branches) {
+      result.branches.push_back(workspace_->push(repositoryPath, RefKind::branch, branch));
+    }
+    for (const std::string& tag : result.fetch.tags) {
+      result.tags.push_back(workspace_->push(repositoryPath, RefKind::tag, tag));
+    }
+
+    result.staleDestinationRefs = workspace_->staleDestinationRefs(repositoryPath, result.fetch);
+
+    const bool fullySynchronized = result.project.visibilityMatchesRequirement &&
+                                   !result.hasRefFailures();
+    result.state = fullySynchronized ? RepositoryState::synchronized
+                                     : RepositoryState::completedWithFailures;
+    if (!fullySynchronized && result.error.empty()) {
+      if (result.hasRefFailures()) {
+        result.category = ErrorCategory::gitCommand;
+        result.error =
+            "at least one destination ref was rejected or failed; it was left as GitLab had it";
+      } else {
+        result.category = ErrorCategory::gitlabProject;
+        result.error = "the GitLab project exists with a visibility that differs from the "
+                       "GitHub source; it was not changed";
+      }
+    }
+    return result;
+  } catch (const std::exception& error) {
+    result.state = RepositoryState::failed;
+    result.category = ErrorCategory::other;
+    result.error = std::string("unexpected error while processing the repository: ") + error.what();
+    return result;
+  }
+}
+
+}  // namespace nfg2glm
