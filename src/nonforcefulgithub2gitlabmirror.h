@@ -18,7 +18,9 @@ namespace nfg2glm {
 /// mirrors every branch and tag into the authenticated user's GitLab namespace.
 class NonForcefulGitHub2GitLabMirror {
  public:
-  NonForcefulGitHub2GitLabMirror() = default;
+  /// @param verbose List every ref of every repository in the final report, including the ones
+  ///                that were already up to date. Off by default, where those are only counted.
+  explicit NonForcefulGitHub2GitLabMirror(bool verbose = false) : verbose_(verbose) {}
 
   /// Run the synchronization and return the process exit status.
   int run();
@@ -35,6 +37,7 @@ class NonForcefulGitHub2GitLabMirror {
   std::unique_ptr<GitLabProjects> projects_;
   std::unique_ptr<GitWorkspace> workspace_;
   std::map<std::string, std::string> projectPathOwners_;
+  bool verbose_ = false;
   RunResult result_;
 };
 

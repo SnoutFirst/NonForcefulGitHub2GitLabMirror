@@ -24,14 +24,23 @@ void printRefs(std::ostream& stream, const std::vector<FetchRefResult>& refs) {
   }
 }
 
-void printRefs(std::ostream& stream, const std::vector<RefPushResult>& refs) {
+/// Print one line per pushed ref that was *not* simply already up to date, and return how many
+/// unchanged refs were left out so the caller can report their count instead of their names.
+std::size_t printRefs(std::ostream& stream, const std::vector<RefPushResult>& refs, bool verbose) {
+  std::size_t upToDate = 0;
   for (const RefPushResult& ref : refs) {
-    stream << "    " << describe(ref.kind) << ' ' << ref.name << ": " << describe(ref.state);
-    if (!ref.detail.empty()) {
+    if (!verbose && ref.state == RefPushState::alreadyUpToDate) {
+      ++upToDate;
+      continue;
+    }
+    const std::string state = describe(ref.state);
+    stream << "    " << describe(ref.kind) << ' ' << ref.name << ": " << state;
+    if (!ref.detail.empty() && ref.detail != state) {
       stream << " [" << ref.detail << ']';
     }
     stream << '\n';
   }
+  return upToDate;
 }
 
 /// A bulk push command that failed as a whole is reported next to the per-ref lines, never
@@ -110,7 +119,7 @@ std::size_t countPushedRefs(const RunResult& result, RefKind kind) {
 
 }  // namespace
 
-void printRepositoryReport(std::ostream& stream, const RepositoryResult& result) {
+void printRepositoryReport(std::ostream& stream, const RepositoryResult& result, bool verbose) {
   stream << result.repository.fullName << " [" << describe(result.state) << "]\n";
 
   if (result.project.outcome != ProjectOutcome::failed) {
@@ -166,9 +175,15 @@ void printRepositoryReport(std::ostream& stream, const RepositoryResult& result)
   }
 
   printPushError(stream, RefKind::branch, result.branches.operationError);
-  printRefs(stream, result.branches.refs);
+  const std::size_t branchesUpToDate = printRefs(stream, result.branches.refs, verbose);
+  if (!verbose && branchesUpToDate != 0) {
+    stream << "    branches already up to date: " << branchesUpToDate << '\n';
+  }
   printPushError(stream, RefKind::tag, result.tags.operationError);
-  printRefs(stream, result.tags.refs);
+  const std::size_t tagsUpToDate = printRefs(stream, result.tags.refs, verbose);
+  if (!verbose && tagsUpToDate != 0) {
+    stream << "    tags already up to date: " << tagsUpToDate << '\n';
+  }
 
   if (!result.staleDestinationRefs.empty()) {
     stream << "  stale destination refs (left untouched): ";
@@ -194,7 +209,7 @@ void printRepositoryReport(std::ostream& stream, const RepositoryResult& result)
   }
 }
 
-void printRunReport(std::ostream& stream, const RunResult& result) {
+void printRunReport(std::ostream& stream, const RunResult& result, bool verbose) {
   stream << "\nSynchronization report\n=====================\n";
   stream << "Local data directory: " << result.dataDirectory.string() << '\n';
   if (!result.discoveryComplete) {
@@ -246,12 +261,16 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
   }
 
   stream << "\nRepository details\n------------------\n";
+  if (!verbose) {
+    stream << "Only refs that were pushed, rejected or left unknown are listed per repository;\n"
+              "unchanged refs are counted. Pass --verbose to list every ref.\n";
+  }
   if (result.repositories.empty()) {
     stream << "(no repositories were discovered)\n";
     return;
   }
   for (const RepositoryResult& repository : result.repositories) {
-    printRepositoryReport(stream, repository);
+    printRepositoryReport(stream, repository, verbose);
     stream << '\n';
   }
 }

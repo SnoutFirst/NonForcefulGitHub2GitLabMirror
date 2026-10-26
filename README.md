@@ -166,11 +166,17 @@ to `LC_ALL=C` so that the reason text of a refused ref update is always the same
 ## 7. Usage
 
 ```sh
-NonForcefulGitHub2GitLabMirror
+NonForcefulGitHub2GitLabMirror [--verbose]
 ```
 
-The program takes no arguments. It prints the absolute local data directory at startup and in the
-final report, then processes every discovered repository.
+The only option is `--verbose` (`-v`); `--help` (`-h`) prints the usage. The program prints the
+absolute local data directory at startup and in the final report, then processes every discovered
+repository.
+
+In the final report, refs that were pushed, rejected or left unknown are **always** listed one line
+each. A ref that was merely `already up to date` is not: by default those are counted in a single
+line per repository (`branches already up to date: 11`), and `--verbose` turns the old
+one-line-per-ref listing back on for every ref of every repository.
 
 Process exit status:
 
@@ -185,7 +191,8 @@ Process exit status:
   repository keeps the exit status non-zero on every run until the divergence is resolved by hand.
   The last line of the output says `Result: GITHUB HISTORY WAS REWRITTEN (...)`, naming the number
   of refs and repositories.
-* `2` – command line arguments were supplied.
+* `2` – an unknown command line argument was supplied (the usage is printed to stderr). `--help`
+  exits 0.
 
 ## 8. Local storage
 
@@ -391,11 +398,14 @@ After every repository has been processed the program prints:
   sides and how to resolve it,
 * the number of name collisions,
 * a per-repository block for **every** discovered repository, including skipped and failed ones, with
-  its project outcome, local repository state, fetch result, one line per branch and per tag, stale
-  destination refs, notes and the error category. A push command that failed *as a whole* is shown
-  on its own `branch push failed [...]` / `tag push failed [...]` line, next to — never instead of —
-  the per-ref lines it did report. Refused or kept *source* refs are listed as
-  `source <kind> <name>: ...` lines inside the same block, and are never counted as failures,
+  its project outcome, local repository state, fetch result, one line per branch and per tag that
+  changed, stale destination refs, notes and the error category. A push command that failed *as a
+  whole* is shown on its own `branch push failed [...]` / `tag push failed [...]` line, next to —
+  never instead of — the per-ref lines it did report. Refused or kept *source* refs are listed as
+  `source <kind> <name>: ...` lines inside the same block, and are never counted as failures. The
+  block is deliberately quiet about refs that did not change: unless `--verbose` is given, one line
+  per kind reports how many were already up to date (`branches already up to date: 11`,
+  `tags already up to date: 2`), and the details section is prefaced with a line saying so.
 * a phase timing block with the wall-clock cost of repository discovery, local repository setup,
   source fetch, destination ref listing, the bulk branch push, the bulk tag push, report generation,
   and the total before the report was rendered.
@@ -427,7 +437,7 @@ example/project [UPSTREAM DIVERGED (nothing forced)]
   ...
   fetch: 1 branch(es), 1 tag(s) (0 created, 0 updated, 1 unchanged, 1 refused)
     source branch main: update refused (non-fast-forward) [GitHub rewrote the branch; the local tracking ref and the GitLab branch were kept]
-    branch main: already up to date [up to date]
+    branches already up to date: 1
   error: GitHub rewrote 1 source ref(s); each one was left as it was and nothing was forced. The GitLab ref and the local backup still hold the previous history -- resolve the rewrite by hand (see the README) (GitHub history rewritten)
   ...
 
@@ -435,7 +445,8 @@ Result: GITHUB HISTORY WAS REWRITTEN (1 ref(s) in 1 repository(ies)) -- nothing 
 ```
 
 The exit status is 1. Nothing was forced and nothing was lost — but the run is not reported as a
-success, because the rewrite is the one fact the operator must not miss.
+success, because the rewrite is the one fact the operator must not miss. Run again with `--verbose`
+and the same block lists `branch main`, `tag v1` and every other unchanged ref one line each.
 
 ## 13. Verification performed during development
 
@@ -485,7 +496,7 @@ recorded and audited**. 1227 checks, built with `-fsanitize=address,undefined`, 
   unmarked fast-forward rows, the `(reason)` split, and `fatal:` lines.
 
 The second harness runs the shipped binary end to end against stub `gh`/`glab` executables and local
-bare repositories (no network, no credentials), four runs of one repository:
+bare repositories (no network, no credentials), five runs of one repository:
 
 1. **fresh**: project created, 1 branch and 2 tags pushed,
    `GitHub rewrites detected (nothing forced, old refs kept): 0`, `Result: SUCCESS`, exit status 0;
@@ -505,6 +516,13 @@ bare repositories (no network, no credentials), four runs of one repository:
    both the workspace and GitLab. This run still exits 1, because the branch rewritten in run 2 is
    still divergent — the intended behaviour: an unresolved rewrite is reported on every run, while
    a *deletion* alone would not change the exit status.
+5. **`--verbose`**: the same state reported one line per ref — `tag v1: already up to date` — with
+   no `... already up to date: N` count lines and no "Pass --verbose" hint, and the same exit
+   status, because the flag changes only how the report is rendered.
+
+Default-mode reporting is checked in every run: the unchanged refs are counted rather than listed,
+and no ref line contains `already up to date` unless `--verbose` was passed. The script also checks
+that an unknown argument exits 2 and that `--help` exits 0.
 
 Two facts were established empirically while building this, because they decide the design:
 

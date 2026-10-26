@@ -27,7 +27,7 @@ int NonForcefulGitHub2GitLabMirror::run() {
     result_.elapsedMs = elapsedMilliseconds(runStarted);
     const auto reportStarted = std::chrono::steady_clock::now();
     std::ostringstream body;
-    printRunReport(body, result_);
+    printRunReport(body, result_, verbose_);
     result_.reportGenerationMs = elapsedMilliseconds(reportStarted);
     std::cout << body.str();
     printRunTimings(std::cout, result_);
@@ -250,17 +250,17 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
     } else {
       result.state = RepositoryState::synchronized;
     }
-    if (diverged) {
-      const std::string count = std::to_string(result.fetch.refusedRefs());
+    if (diverged && !failed) {
       result.category = ErrorCategory::upstreamRewrite;
-      result.error = "GitHub rewrote " + count +
+      result.error = "GitHub rewrote " + std::to_string(result.fetch.refusedRefs()) +
                      " source ref(s); each one was left as it was and nothing was forced. The "
                      "GitLab ref and the local backup still hold the previous history -- resolve "
                      "the rewrite by hand (see the README)";
-      if (failed) {
-        result.notes.push_back("GitHub also rewrote " + count +
-                               " source ref(s); those refs were kept as they were");
-      }
+    } else if (diverged) {
+      // The rewrite is not the reason this repository failed, so it must not overwrite the reason
+      // that is. It is reported as a note (and in the report's rewrite block) instead.
+      result.notes.push_back("GitHub also rewrote " + std::to_string(result.fetch.refusedRefs()) +
+                             " source ref(s); those refs were kept as they were");
     }
     if (failed && result.error.empty()) {
       if (result.fetch.hasRefFailures()) {
