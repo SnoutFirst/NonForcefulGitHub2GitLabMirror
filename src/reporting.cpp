@@ -220,10 +220,30 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
   stream << "Git push commands: " << countPushCommands(result) << " (branches: "
          << countPushCommands(result, RefKind::branch) << ", tags: "
          << countPushCommands(result, RefKind::tag) << ")\n";
-  stream << "Source updates refused (existing refs kept): " << result.sourceRefsRefused() << '\n';
+  stream << "GitHub rewrites detected (nothing forced, old refs kept): "
+         << result.sourceRefsRefused() << '\n';
   stream << "Source refs GitHub no longer has (kept as backup): " << result.sourceRefsRetained()
          << '\n';
   stream << "Name collisions: " << result.collisions() << '\n';
+
+  // A refused rewrite is the reason this tool exists, so it gets its own block at the top of the
+  // report rather than being one fact among many in the per-repository details.
+  if (result.sourceRefsRefused() != 0) {
+    stream << "\nGitHub history was rewritten (nothing was forced)\n"
+              "-------------------------------------------------\n";
+    for (const RepositoryResult& repository : result.repositories) {
+      for (const FetchRefResult& ref : repository.fetch.refs) {
+        if (!ref.refused()) {
+          continue;
+        }
+        stream << repository.repository.fullName << ": " << describe(ref.kind) << ' ' << ref.name
+               << " (" << describe(ref.state) << ")\n";
+      }
+    }
+    stream << "The GitLab refs and the local source-tracking refs still hold the history this\n"
+              "mirror had before the rewrite. Resolve each one by hand (README: \"what happens when\n"
+              "GitHub is rewritten\"); until then every run exits non-zero.\n";
+  }
 
   stream << "\nRepository details\n------------------\n";
   if (result.repositories.empty()) {

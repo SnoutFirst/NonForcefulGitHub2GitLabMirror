@@ -72,6 +72,19 @@ int NonForcefulGitHub2GitLabMirror::run() {
   synchronize(discovery.repositories);
   emitReport();
 
+  if (result_.sourceRefsRefused() != 0) {
+    // Deliberately not "SUCCESS": the only reason this tool exists is to notice that GitHub
+    // rewrote history, so a refusal must reach the operator through the exit status as well.
+    std::cout << "\nResult: GITHUB HISTORY WAS REWRITTEN (" << result_.sourceRefsRefused()
+              << " ref(s) in " << result_.divergedRepositories()
+              << " repository(ies)) -- nothing was forced, see \"GitHub history was rewritten\" "
+                 "above\n";
+    if (result_.repositoriesWithFailures() != 0 || result_.skippedRepositories() != 0 ||
+        result_.collisions() != 0 || !result_.discoveryComplete) {
+      std::cout << "The run reported other problems as well; see the report above.\n";
+    }
+    return 1;
+  }
   if (!result_.successful()) {
     std::cout << "\nResult: FAILED (see the report above)\n";
     return 1;
@@ -223,12 +236,33 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
     result.staleDestinationRefs = workspace_->staleDestinationRefs(repositoryPath, result.fetch);
     result.timings.destinationListingMs = elapsedMilliseconds(phaseStarted);
 
-    const bool fullySynchronized = result.project.visibilityMatchesRequirement &&
-                                   !result.fetch.hasRefFailures() && !result.hasRefFailures() &&
-                                   !result.hasPushErrors();
-    result.state = fullySynchronized ? RepositoryState::synchronized
-                                     : RepositoryState::completedWithFailures;
-    if (!fullySynchronized && result.error.empty()) {
+    const bool diverged = result.sourceDiverged();
+    const bool failed = !result.project.visibilityMatchesRequirement ||
+                        result.fetch.hasRefFailures() || result.hasRefFailures() ||
+                        result.hasPushErrors();
+    if (failed) {
+      result.state = RepositoryState::completedWithFailures;
+    } else if (diverged) {
+      // Every ref that could be pushed is in place, but GitHub rewrote something. Say so, and let
+      // the run fail: reporting a rewrite as if it were an ordinary success defeats the purpose of
+      // the tool.
+      result.state = RepositoryState::diverged;
+    } else {
+      result.state = RepositoryState::synchronized;
+    }
+    if (diverged) {
+      const std::string count = std::to_string(result.fetch.refusedRefs());
+      result.category = ErrorCategory::upstreamRewrite;
+      result.error = "GitHub rewrote " + count +
+                     " source ref(s); each one was left as it was and nothing was forced. The "
+                     "GitLab ref and the local backup still hold the previous history -- resolve "
+                     "the rewrite by hand (see the README)";
+      if (failed) {
+        result.notes.push_back("GitHub also rewrote " + count +
+                               " source ref(s); those refs were kept as they were");
+      }
+    }
+    if (failed && result.error.empty()) {
       if (result.fetch.hasRefFailures()) {
         result.category = ErrorCategory::gitCommand;
         result.error =

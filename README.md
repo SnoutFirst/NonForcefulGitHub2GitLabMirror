@@ -22,7 +22,8 @@ For every repository returned by the GitHub REST endpoint `/user/repos` with
    (`refs/nonforceful-github/heads/*`) with one non-forced `git fetch`, and every tag GitHub has
    and the workspace does not yet have (`refs/nonforceful-github/tags/*`) with explicit refspecs.
    A rewritten branch or a moved tag is refused by Git; the local copy keeps the history it
-   already had.
+   already had. A refusal is then reported prominently and makes the run exit non-zero — detecting
+   rewrites is the point of the tool, so one is never reported as an ordinary success.
 4. Push all branches with one ordinary, non-forced `git push` and all tags with another — one Git
    process per repository and namespace, however many refs there are.
 5. Record the outcome per repository and per ref, continue with the next repository, and print a
@@ -84,9 +85,12 @@ GitLab is **not** guaranteed to be byte-for-byte or ref-for-ref identical to Git
 In those cases the local workspace keeps the previous state — the rewrite is refused at fetch time,
 not only at push time — and the destination keeps it too. Every case is reported per ref. This is
 intentional: the application never resolves a conflict by overwriting or deleting a ref in either
-repository. If you really want the mirror to follow a rewritten source, resolve it yourself: delete
-the source-tracking ref and the GitLab ref (or reset the GitLab ref), and the next run picks up
-GitHub's current history again.
+repository. A rewrite is not silent either: the repository is reported as
+`UPSTREAM DIVERGED (nothing forced)`, the report opens with a dedicated list of the rewritten refs,
+and the run exits non-zero (see §7) — while a ref that GitHub merely deleted stays informational,
+because nothing was rewritten. If you really want the mirror to follow a rewritten source, resolve
+it yourself: delete the source-tracking ref and the GitLab ref (or reset the GitLab ref), and the
+next run picks up GitHub's current history again.
 
 ## 3. Supported operating systems
 
@@ -170,13 +174,17 @@ final report, then processes every discovered repository.
 
 Process exit status:
 
-* `0` – every discovered repository synchronized and every ref is in place (up-to-date refs count as
-  success), and discovery was complete. A source ref that was deliberately left as it was — because
-  GitHub rewrote a branch or moved a tag, or because GitHub no longer has the ref — counts as
-  success too: refusing the rewrite is the intended result, and the report names every affected
-  ref.
+* `0` – every discovered repository synchronized, every ref is in place (up-to-date refs count as
+  success), gap-free discovery, and **GitHub rewrote nothing**. A source ref that GitHub simply no
+  longer has does count as success: it was not rewritten, and the local and GitLab copies are kept
+  deliberately.
 * `1` – at least one repository or ref failed, a project-name collision occurred, a visibility
-  discrepancy was found, discovery was incomplete, or authentication/tool checks failed.
+  discrepancy was found, discovery was incomplete, authentication/tool checks failed, **or GitHub
+  rewrote a branch / moved a tag**. A refused rewrite is the correct *action* and nothing is forced,
+  but it is not a successful *run*: the point of the tool is to notice rewrites, so a `diverged`
+  repository keeps the exit status non-zero on every run until the divergence is resolved by hand.
+  The last line of the output says `Result: GITHUB HISTORY WAS REWRITTEN (...)`, naming the number
+  of refs and repositories.
 * `2` – command line arguments were supplied.
 
 ## 8. Local storage
@@ -230,8 +238,9 @@ git fetch --no-tags --no-prune --no-prune-tags github \
 No `+`, no `--force`. Git therefore updates a branch only when the new value is a fast-forward of
 the old one. When GitHub was rewritten, Git refuses the update, prints
 `! [rejected] ... (non-fast-forward)`, the source-tracking ref keeps the value it had, and the run
-reports the refusal per branch. That is the whole protection: the rewritten history never enters the
-workspace, so it can never reach GitLab either.
+reports the refusal per branch and per repository (`UPSTREAM DIVERGED (nothing forced)`, exit status
+1). That is the whole protection: the rewritten history never enters the workspace, so it can never
+reach GitLab either.
 
 Tags are treated differently on purpose. A wildcard tag refspec would be applied by Git to tags
 that already exist, and Git accepts a tag that moved **forward** to a descendant commit as an
@@ -326,11 +335,15 @@ Fetch results appear in the same report block, in the same shape, above the push
 ```
 
 Only refs that were refused, kept, or failed are listed; `created`, `updated` and
-`already up to date` are counted in the header. A refusal is **not** a failure of the run: the
-mirror is in the state it is designed to be in, so the repository stays `synchronized` and the exit
-status is unaffected. A ref that could not be fetched at all (transport, permissions) *is* a
-failure: it is listed as `failed`, the remaining refs are still pushed, and the repository is
-counted as completed-with-failures.
+`already up to date` are counted in the header. A refusal is not a failure of the *fetch phase* —
+the mirror is in exactly the state it is designed to be in, and the other refs are still pushed —
+but it is never a silent success either: the repository becomes `diverged` rather than
+`synchronized`, the run's summary opens with a `GitHub history was rewritten (nothing was forced)`
+block naming each affected repository and ref, and the exit status is 1. A ref that could not be
+fetched at all (transport, permissions) *is* a failure: it is listed as `failed`, the remaining refs
+are still pushed, and the repository is counted as completed-with-failures. A repository with both a
+rewrite and a real failure is counted as completed-with-failures, so the failure is not masked, and
+the rewrite block and the `Result: GITHUB HISTORY WAS REWRITTEN` line are still printed.
 
 ## 11. Project lookup, creation and collisions
 
@@ -369,8 +382,13 @@ After every repository has been processed the program prints:
 * tags pushed (and how many were already up to date) and tag conflicts/failures,
 * how many `git push` processes were needed, with the branch/tag split — two per repository is the
   norm, one per namespace, regardless of the number of refs,
-* how many source ref updates were refused because GitHub rewrote a branch or moved a tag, and how
-  many source refs GitHub no longer has (both are informational: those refs are kept),
+* how many source ref updates were refused because GitHub rewrote a branch or moved a tag
+  (`GitHub rewrites detected (nothing forced, old refs kept): N`), and how many source refs GitHub
+  no longer has (informational: those refs are kept),
+* when any rewrite was refused, a `GitHub history was rewritten (nothing was forced)` block right
+  under the counters, naming every repository and ref concerned (`repo: branch dev (update refused
+  (non-fast-forward))`), plus a closing line explaining that the previous history is still on both
+  sides and how to resolve it,
 * the number of name collisions,
 * a per-repository block for **every** discovered repository, including skipped and failed ones, with
   its project outcome, local repository state, fetch result, one line per branch and per tag, stale
@@ -381,6 +399,43 @@ After every repository has been processed the program prints:
 * a phase timing block with the wall-clock cost of repository discovery, local repository setup,
   source fetch, destination ref listing, the bulk branch push, the bulk tag push, report generation,
   and the total before the report was rendered.
+
+A run in which GitHub had rewritten exactly one branch of one otherwise unchanged repository —
+nothing forced, every other ref already in place — ends like this (elided lines marked `...`):
+
+```
+Repositories discovered: 4
+Repositories synchronized: 3
+Repositories with failures: 0
+Repositories skipped: 0
+...
+GitHub rewrites detected (nothing forced, old refs kept): 1
+Source refs GitHub no longer has (kept as backup): 0
+Name collisions: 0
+
+GitHub history was rewritten (nothing was forced)
+-------------------------------------------------
+example/project: branch main (update refused (non-fast-forward))
+The GitLab refs and the local source-tracking refs still hold the history this
+mirror had before the rewrite. Resolve each one by hand (README: "what happens when
+GitHub is rewritten"); until then every run exits non-zero.
+
+Repository details
+------------------
+...
+example/project [UPSTREAM DIVERGED (nothing forced)]
+  ...
+  fetch: 1 branch(es), 1 tag(s) (0 created, 0 updated, 1 unchanged, 1 refused)
+    source branch main: update refused (non-fast-forward) [GitHub rewrote the branch; the local tracking ref and the GitLab branch were kept]
+    branch main: already up to date [up to date]
+  error: GitHub rewrote 1 source ref(s); each one was left as it was and nothing was forced. The GitLab ref and the local backup still hold the previous history -- resolve the rewrite by hand (see the README) (GitHub history rewritten)
+  ...
+
+Result: GITHUB HISTORY WAS REWRITTEN (1 ref(s) in 1 repository(ies)) -- nothing was forced, see "GitHub history was rewritten" above
+```
+
+The exit status is 1. Nothing was forced and nothing was lost — but the run is not reported as a
+success, because the rewrite is the one fact the operator must not miss.
 
 ## 13. Verification performed during development
 
@@ -432,16 +487,24 @@ recorded and audited**. 1227 checks, built with `-fsanitize=address,undefined`, 
 The second harness runs the shipped binary end to end against stub `gh`/`glab` executables and local
 bare repositories (no network, no credentials), four runs of one repository:
 
-1. **fresh**: project created, 1 branch and 2 tags pushed, `Source updates refused ...: 0`, exit
-   status 0; the workspace has no `remote.github.fetch` and no `refs/remotes` namespace, and
+1. **fresh**: project created, 1 branch and 2 tags pushed,
+   `GitHub rewrites detected (nothing forced, old refs kept): 0`, `Result: SUCCESS`, exit status 0;
+   the workspace has no `remote.github.fetch` and no `refs/remotes` namespace, and
    `refs/remotes/gitlab/*` is *not* created by the push (see below);
 2. **GitHub rewrite**: reported as `source branch main: update refused (non-fast-forward)`, the
-   GitLab branch still holds the pre-rewrite commit, the workspace backup matches it, and the exit
-   status is still 0 — a refused rewrite is the intended state, not a failure;
+   repository as `UPSTREAM DIVERGED (nothing forced)`, `Repositories synchronized: 0`, a
+   `GitHub history was rewritten (nothing was forced)` block naming `fixture/project: branch main
+   (update refused (non-fast-forward))`, the closing line
+   `Result: GITHUB HISTORY WAS REWRITTEN (...)`, and **exit status 1**; the GitLab branch still
+   holds the pre-rewrite commit and the workspace backup matches it;
 3. **destination divergence**: `branch main: rejected (non-fast-forward)`,
-   `Branch conflicts/failures: 1`, exit status 1, and the destination keeps its history;
+   `Branch conflicts/failures: 1`, `Repositories with failures: 1`, exit status 1, and the
+   destination keeps its history; the rewrite headline is still printed, followed by
+   `The run reported other problems as well`, so a real failure is never hidden behind it;
 4. **GitHub tag deletion**: `tag light: kept (GitHub no longer has it)`, and the tag survives in
-   both the workspace and GitLab.
+   both the workspace and GitLab. This run still exits 1, because the branch rewritten in run 2 is
+   still divergent — the intended behaviour: an unresolved rewrite is reported on every run, while
+   a *deletion* alone would not change the exit status.
 
 Two facts were established empirically while building this, because they decide the design:
 
@@ -577,7 +640,8 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
 * a GitHub visibility change (public → private) reported as a discrepancy without changing the
   existing public GitLab project, with exit status 1; after restoring the visibility the run returned
   to success;
-* final report content and exit statuses (0 for a clean run, 1 when anything failed).
+* final report content and exit statuses (0 for a clean run, 1 when anything failed or when GitHub
+  had rewritten a ref).
 
 ### Not verified
 
@@ -619,8 +683,9 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
 * The mirror is deliberately not exact when the source is rewritten or refs are deleted, for the
   safety reasons described above.
 * A rewritten branch or a moved tag stays refused on **every** run until it is resolved by hand: the
-  workspace never accepts the new history, so it never reaches GitLab either. The report says so on
-  each run. Resolving it means deleting the source-tracking ref and the GitLab ref (or resetting the
+  workspace never accepts the new history, so it never reaches GitLab either. Every such run exits
+  1 and names the affected refs; the exit status therefore stays non-zero until the divergence is
+  dealt with, which is deliberate. Resolving it means deleting the source-tracking ref and the GitLab ref (or resetting the
   GitLab ref) yourself.
 * Concurrent runs of the program against the same data directory are not supported: there is no
   lock, and two runs would fetch into the same tracking namespace. (Two runs racing on the *first*

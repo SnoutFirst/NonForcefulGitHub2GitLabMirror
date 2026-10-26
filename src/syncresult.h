@@ -18,6 +18,7 @@ enum class ErrorCategory {
   localRepository,
   filesystem,
   gitCommand,
+  upstreamRewrite,
   collision,
   other
 };
@@ -112,10 +113,11 @@ struct FetchRefResult {
 
 /// Result of fetching one repository.
 ///
-/// A refused non-fast-forward update or a moved tag is a *success* of this phase, not a failure:
+/// A refused non-fast-forward update or a moved tag is a *success of this phase*, not of the run:
 /// the point of the non-forced fetch is that the existing source-tracking ref, which is also the
-/// backup of the previous GitHub history, survives. It is reported per ref so that the operator
-/// can see which upstream refs were rewritten.
+/// backup of the previous GitHub history, survives. The refusal is reported per ref and, unlike an
+/// ordinary successful fetch, it makes the repository `diverged` and the whole run exit non-zero —
+/// the tool exists to surface rewrites, so it must never report one as an ordinary success.
 enum class FetchState {
   succeeded,  ///< Every ref was fetched, or deliberately left as it was.
   partial,    ///< A fetch command completed but at least one ref could not be fetched.
@@ -170,8 +172,11 @@ struct ProjectResult {
 };
 
 enum class RepositoryState {
-  synchronized,           ///< Every requested ref is in place, or is deliberately left as it was
-                          ///< because GitHub rewrote it (a refusal, not a failure).
+  synchronized,           ///< Every requested ref is in place and GitHub rewrote nothing.
+  diverged,               ///< Every ref that could be pushed is in place, but GitHub rewrote a
+                          ///< branch or moved a tag, so that ref was deliberately left as it was.
+                          ///< Nothing was forced. This is *not* a success of the run: the exit
+                          ///< status is non-zero so the rewrite is never silent.
   completedWithFailures,  ///< Processing finished but at least one ref or step failed.
   skipped,                ///< Deliberately not touched (collision, foreign local repository).
   failed                  ///< The repository could not be processed at all.
@@ -204,6 +209,8 @@ struct RepositoryResult {
 
   bool hasRefFailures() const;
   bool hasPushErrors() const;
+  /// True when GitHub rewrote a branch or moved a tag, so that ref was left as it was.
+  bool sourceDiverged() const { return fetch.refusedRefs() != 0; }
   std::size_t branchesSucceeded() const;
   std::size_t branchesFailed() const;
   std::size_t tagsSucceeded() const;
@@ -221,6 +228,8 @@ struct RunResult {
 
   std::size_t discoveredRepositories() const { return repositories.size(); }
   std::size_t synchronizedRepositories() const;
+  /// Repositories where GitHub rewrote a branch or moved a tag. Not a success: exits non-zero.
+  std::size_t divergedRepositories() const;
   std::size_t repositoriesWithFailures() const;
   std::size_t skippedRepositories() const;
   std::size_t projectsCreated() const;

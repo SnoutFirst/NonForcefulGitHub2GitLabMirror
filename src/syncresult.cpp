@@ -18,6 +18,8 @@ std::string describe(ErrorCategory category) {
       return "local filesystem failure";
     case ErrorCategory::gitCommand:
       return "Git command failure";
+    case ErrorCategory::upstreamRewrite:
+      return "GitHub history rewritten";
     case ErrorCategory::collision:
       return "GitLab project name collision";
     case ErrorCategory::other:
@@ -114,6 +116,8 @@ std::string describe(RepositoryState state) {
   switch (state) {
     case RepositoryState::synchronized:
       return "synchronized";
+    case RepositoryState::diverged:
+      return "UPSTREAM DIVERGED (nothing forced)";
     case RepositoryState::completedWithFailures:
       return "completed with failures";
     case RepositoryState::skipped:
@@ -170,6 +174,16 @@ std::size_t RunResult::synchronizedRepositories() const {
   std::size_t count = 0;
   for (const RepositoryResult& repository : repositories) {
     if (repository.state == RepositoryState::synchronized) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t RunResult::divergedRepositories() const {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : repositories) {
+    if (repository.state == RepositoryState::diverged) {
       ++count;
     }
   }
@@ -302,7 +316,7 @@ std::size_t RunResult::fetchCommands() const {
 
 bool RunResult::successful() const {
   return discoveryComplete && repositoriesWithFailures() == 0 && skippedRepositories() == 0 &&
-         collisions() == 0;
+         divergedRepositories() == 0 && collisions() == 0;
 }
 
 }  // namespace nfg2glm
