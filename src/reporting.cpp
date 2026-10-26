@@ -7,6 +7,23 @@
 namespace nfg2glm {
 namespace {
 
+void printRefs(std::ostream& stream, const std::vector<FetchRefResult>& refs) {
+  for (const FetchRefResult& ref : refs) {
+    // Only the refs an operator has to know about: refused, kept, or failed.
+    const bool interesting = ref.refused() || ref.state == FetchRefState::retained ||
+                             ref.state == FetchRefState::failed;
+    if (!interesting) {
+      continue;
+    }
+    stream << "    source " << describe(ref.kind) << ' ' << ref.name << ": "
+           << describe(ref.state);
+    if (!ref.detail.empty()) {
+      stream << " [" << ref.detail << ']';
+    }
+    stream << '\n';
+  }
+}
+
 void printRefs(std::ostream& stream, const std::vector<RefPushResult>& refs) {
   for (const RefPushResult& ref : refs) {
     stream << "    " << describe(ref.kind) << ' ' << ref.name << ": " << describe(ref.state);
@@ -124,14 +141,26 @@ void printRepositoryReport(std::ostream& stream, const RepositoryResult& result)
     }
   }
 
-  if (result.fetch.state == FetchState::succeeded) {
+  if (result.fetch.state != FetchState::failed) {
     stream << "  fetch: " << result.fetch.branches.size() << " branch(es), "
            << result.fetch.tags.size() << " tag(s)";
-    if (result.fetch.prunedTrackingRefs != 0) {
-      stream << ", " << result.fetch.prunedTrackingRefs
-             << " stale source-tracking ref(s) removed";
+    if (!result.fetch.refs.empty()) {
+      stream << " (" << result.fetch.countRefs(FetchRefState::created) << " created, "
+             << result.fetch.countRefs(FetchRefState::updated) << " updated, "
+             << result.fetch.countRefs(FetchRefState::upToDate) << " unchanged";
+      if (result.fetch.refusedRefs() != 0) {
+        stream << ", " << result.fetch.refusedRefs() << " refused";
+      }
+      if (result.fetch.retainedRefs() != 0) {
+        stream << ", " << result.fetch.retainedRefs() << " kept without a GitHub ref";
+      }
+      if (result.fetch.hasRefFailures()) {
+        stream << ", " << result.fetch.countRefs(FetchRefState::failed) << " failed";
+      }
+      stream << ')';
     }
     stream << '\n';
+    printRefs(stream, result.fetch.refs);
   } else if (!result.fetch.error.empty()) {
     stream << "  fetch: failed [" << result.fetch.error << "]\n";
   }
@@ -191,6 +220,9 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
   stream << "Git push commands: " << countPushCommands(result) << " (branches: "
          << countPushCommands(result, RefKind::branch) << ", tags: "
          << countPushCommands(result, RefKind::tag) << ")\n";
+  stream << "Source updates refused (existing refs kept): " << result.sourceRefsRefused() << '\n';
+  stream << "Source refs GitHub no longer has (kept as backup): " << result.sourceRefsRetained()
+         << '\n';
   stream << "Name collisions: " << result.collisions() << '\n';
 
   stream << "\nRepository details\n------------------\n";
@@ -212,7 +244,8 @@ void printRunTimings(std::ostream& stream, const RunResult& result) {
          << countLocalRepositorySetups(result) << " workspace(s))\n";
   stream << "Source fetch:                    "
          << milliseconds(totalMilliseconds(result, &PhaseTimings::fetchMs)) << " ms ("
-         << countFetchAttempts(result) << " fetch command(s), one per repository)\n";
+         << countFetchAttempts(result) << " repository fetch(es), "
+         << result.fetchCommands() << " git fetch command(s))\n";
   stream << "Destination ref listing:         "
          << milliseconds(totalMilliseconds(result, &PhaseTimings::destinationListingMs))
          << " ms (" << countDestinationListings(result) << " listing(s))\n";

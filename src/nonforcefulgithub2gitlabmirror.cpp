@@ -224,11 +224,17 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
     result.timings.destinationListingMs = elapsedMilliseconds(phaseStarted);
 
     const bool fullySynchronized = result.project.visibilityMatchesRequirement &&
-                                   !result.hasRefFailures() && !result.hasPushErrors();
+                                   !result.fetch.hasRefFailures() && !result.hasRefFailures() &&
+                                   !result.hasPushErrors();
     result.state = fullySynchronized ? RepositoryState::synchronized
                                      : RepositoryState::completedWithFailures;
     if (!fullySynchronized && result.error.empty()) {
-      if (result.hasRefFailures()) {
+      if (result.fetch.hasRefFailures()) {
+        result.category = ErrorCategory::gitCommand;
+        result.error =
+            "at least one GitHub ref could not be fetched; the refs that were available were "
+            "still pushed, and the rejected ones were left as they were";
+      } else if (result.hasRefFailures()) {
         result.category = ErrorCategory::gitCommand;
         result.error =
             "at least one destination ref was rejected or failed; it was left as GitLab had it";

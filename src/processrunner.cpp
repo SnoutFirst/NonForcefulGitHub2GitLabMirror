@@ -32,10 +32,12 @@ EnvironmentString toEnvironmentString(const std::string& text) {
   return converted;
 }
 
-/// Copy the current environment and force non-interactive Git behaviour.
+/// Copy the current environment, force non-interactive Git behaviour and pin the C locale.
 ///
 /// Credential helpers still run normally; only terminal prompts are disabled so that an
-/// unattended run can never block waiting for a password.
+/// unattended run can never block waiting for a password. The locale is pinned because the reason
+/// text of a refused ref update is read from Git's message: with a translated message the
+/// classification of a conflict would depend on the machine's language.
 std::vector<EnvironmentString> buildChildEnvironment() {
   std::vector<EnvironmentString> entries;
   for (auto entry : bp::environment::current()) {
@@ -43,14 +45,18 @@ std::vector<EnvironmentString> buildChildEnvironment() {
                       std::get<1>(entry).native_string());
   }
 
-  const EnvironmentString promptPrefix =
-      toEnvironmentString("GIT_TERMINAL_PROMPT") + EnvironmentString(1, '=');
-  entries.erase(std::remove_if(entries.begin(), entries.end(),
-                               [&promptPrefix](const EnvironmentString& entry) {
-                                 return entry.compare(0, promptPrefix.size(), promptPrefix) == 0;
-                               }),
-                entries.end());
-  entries.push_back(promptPrefix + toEnvironmentString("0"));
+  const auto replaceVariable = [&entries](const std::string& name, const std::string& value) {
+    const EnvironmentString prefix = toEnvironmentString(name) + EnvironmentString(1, '=');
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&prefix](const EnvironmentString& entry) {
+                                   return entry.compare(0, prefix.size(), prefix) == 0;
+                                 }),
+                  entries.end());
+    entries.push_back(prefix + toEnvironmentString(value));
+  };
+
+  replaceVariable("GIT_TERMINAL_PROMPT", "0");
+  replaceVariable("LC_ALL", "C");
   return entries;
 }
 

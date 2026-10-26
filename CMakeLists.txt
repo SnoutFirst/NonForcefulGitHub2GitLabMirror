@@ -35,6 +35,7 @@ find_package(Threads REQUIRED)
 
 add_executable(NonForcefulGitHub2GitLabMirror
   src/main.cpp
+  src/fetchstatus.cpp
   src/githubdiscovery.cpp
   src/gitlabproject.cpp
   src/gitworkspace.cpp

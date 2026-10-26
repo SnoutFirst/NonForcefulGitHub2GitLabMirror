@@ -12,9 +12,10 @@ namespace nfg2glm {
 
 /// Owns the persistent bare repositories used as synchronization workspaces.
 ///
-/// Every ref update performed here is an ordinary, non-forced push. Destination refs are
-/// never deleted, reset or overwritten; only the application's private source-tracking
-/// namespace below refs/nonforceful-github/ is ever removed.
+/// Every ref update performed here is ordinary and non-forced, in both directions: the fetch into
+/// refs/nonforceful-github/ refuses a rewritten upstream branch or a moved upstream tag, and the
+/// push to GitLab is rejected by Git when the destination diverged. No ref is ever deleted here,
+/// with or without a corresponding upstream ref.
 class GitWorkspace {
  public:
   GitWorkspace(const ProcessRunner& runner, std::string gitExecutable,
@@ -25,7 +26,13 @@ class GitWorkspace {
                                 const std::filesystem::path& repositoryPath,
                                 const std::string& destinationUrl) const;
 
-  /// Fetch every branch and tag of the GitHub source into the source-tracking namespace.
+  /// Fetch the GitHub branches and the not-yet-known GitHub tags into the source-tracking
+  /// namespace without ever forcing a local ref.
+  ///
+  /// Branches are fetched with one non-forced wildcard refspec, so a rewritten branch is refused
+  /// and keeps its previous local value. Tags are fetched one explicit refspec at a time and only
+  /// while the local tag does not exist, because Git accepts a fast-forward tag move even without
+  /// a forced refspec. A source ref that disappeared on GitHub is reported and kept.
   FetchResult fetchAll(const GitHubRepository& repository,
                        const std::filesystem::path& repositoryPath) const;
 
@@ -53,8 +60,29 @@ class GitWorkspace {
     std::string error;
   };
 
+  struct TrackingRef {
+    std::string objectId;
+    std::string name;
+  };
+
+  struct TrackingRefList {
+    bool ok = false;
+    std::vector<TrackingRef> refs;
+    std::string error;
+  };
+
   RemoteRefList listRemoteRefs(const std::filesystem::path& repositoryPath,
                                const std::string& remote, bool destination) const;
+
+  /// Every ref below refs/nonforceful-github/, read before and after each fetch.
+  TrackingRefList listTrackingRefs(const std::filesystem::path& repositoryPath) const;
+
+  /// Remove the forced refspecs that `git remote add` writes for both remotes.
+  bool clearConfiguredFetchRefspecs(const std::filesystem::path& repositoryPath,
+                                    std::vector<std::string>& repairs) const;
+  bool clearConfiguredFetchRefspec(const std::filesystem::path& repositoryPath,
+                                   const std::string& remote,
+                                   std::vector<std::string>& repairs) const;
 
   /// Arguments that let the matching CLI act as Git's credential helper for one command.
   std::vector<std::string> credentialArguments(bool destination) const;

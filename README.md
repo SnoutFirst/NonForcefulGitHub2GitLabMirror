@@ -18,8 +18,11 @@ For every repository returned by the GitHub REST endpoint `/user/repos` with
    it when it does not exist, with the visibility rule described below — and switch CI/CD off on a
    project that was just created.
 2. Locate or create a persistent **bare** Git repository as the synchronization workspace.
-3. Fetch every GitHub branch and every GitHub tag into a private source-tracking namespace
-   (`refs/nonforceful-github/heads/*`, `refs/nonforceful-github/tags/*`) with a single `git fetch`.
+3. Fetch every GitHub branch into a private source-tracking namespace
+   (`refs/nonforceful-github/heads/*`) with one non-forced `git fetch`, and every tag GitHub has
+   and the workspace does not yet have (`refs/nonforceful-github/tags/*`) with explicit refspecs.
+   A rewritten branch or a moved tag is refused by Git; the local copy keeps the history it
+   already had.
 4. Push all branches with one ordinary, non-forced `git push` and all tags with another — one Git
    process per repository and namespace, however many refs there are.
 5. Record the outcome per repository and per ref, continue with the next repository, and print a
@@ -37,16 +40,33 @@ These are invariants of the implementation, not options:
   `git push --porcelain <remote> refs/nonforceful-github/tags/*:refs/tags/*`, and a guard rejects
   any destructive or forced option — and any refspec that starts with `+` — before a process is
   started.
+* **No forced fetch either.** The branch fetch refspec is exactly
+  `refs/heads/*:refs/nonforceful-github/heads/*` — no leading `+`, no `--force`, no
+  `--force-with-lease`. A rewritten GitHub branch is therefore *refused by Git*, and the
+  source-tracking ref keeps the history the workspace already had. Ordinary fast-forward updates
+  are unaffected.
+* `git remote add` writes a forced refspec of its own
+  (`+refs/heads/*:refs/remotes/<remote>/*`). Both remotes have theirs removed before anything is
+  fetched or pushed, so no forced refspec exists anywhere in a workspace, and no
+  `refs/remotes/<remote>/*` ref is updated behind the program's back.
+* Tags are never fetched with a wildcard refspec. Git accepts a tag that moved *forward* as an
+  ordinary fast-forward update even without a forced refspec, so a wildcard would silently replace
+  an existing tag. Each tag is fetched with its own explicit refspec, and only while the local tag
+  does not exist; an existing local tag is never fetched again, whatever GitHub did to it.
 * No `git reset --hard`, no `git clean`, no `--mirror`, no `--delete`, no `--prune`, no
-  `gh repo sync --force`.
+  `--prune-tags`, no `gh repo sync --force`. The fetch is additionally started with `--no-prune`
+  and `--no-prune-tags` so that a global `fetch.prune`/`fetch.pruneTags` cannot prune anything.
 * **Destination branches and tags are never deleted, never force-updated and never reset.** A
   non-fast-forward branch update or a tag that already points at a different object is *rejected by
   Git*, recorded as a conflict, and left exactly as GitLab had it.
 * A destination ref that has no corresponding GitHub ref (because the source branch or tag was
   deleted) is reported as a stale destination ref and **left in place**.
-* The only refs ever removed are the application's own source-tracking refs below
-  `refs/nonforceful-github/`, and they are removed only because GitHub no longer has them. Removing
-  a ref never removes an object, a local branch or a tag.
+* **No ref is ever deleted, in either repository.** A GitHub branch or tag that disappears leaves
+  its source-tracking ref and its GitLab counterpart in place: they are reported (as
+  `kept (GitHub no longer has it)` and as a stale destination ref) and kept as backup data. There
+  is no pruning step and no `update-ref -d` in the synchronization path.
+* There is no archival ref namespace and no archival synchronization. The persistent bare
+  repository plus the GitLab project *are* the backup.
 * No shell is involved: `gh`, `glab` and `git` are launched as subprocesses with each argument passed
   separately, so repository names, URLs and ref names can never be re-interpreted by a shell.
 * A failing repository, branch or tag never aborts the run.
@@ -61,9 +81,12 @@ GitLab is **not** guaranteed to be byte-for-byte or ref-for-ref identical to Git
 * a source tag was moved to a different object, or
 * a source branch or tag was deleted.
 
-In those cases the destination keeps the previous state and the conflict is reported. This is
-intentional: the application never resolves a conflict by overwriting or deleting destination refs.
-Delete the destination ref yourself if you really want the mirror to follow a rewritten source.
+In those cases the local workspace keeps the previous state — the rewrite is refused at fetch time,
+not only at push time — and the destination keeps it too. Every case is reported per ref. This is
+intentional: the application never resolves a conflict by overwriting or deleting a ref in either
+repository. If you really want the mirror to follow a rewritten source, resolve it yourself: delete
+the source-tracking ref and the GitLab ref (or reset the GitLab ref), and the next run picks up
+GitHub's current history again.
 
 ## 3. Supported operating systems
 
@@ -133,7 +156,8 @@ Git credentials are supplied by the CLIs themselves: for every `git fetch`, `git
 `-c credential.helper= -c credential.helper=!"<gh|glab>" auth git-credential`, so the GitHub CLI is
 used for GitHub URLs and the GitLab CLI for GitLab URLs. Nothing is written to your Git
 configuration and no token ever appears on a command line or in a file. Terminal prompts are
-disabled (`GIT_TERMINAL_PROMPT=0`) so an unattended run cannot block.
+disabled (`GIT_TERMINAL_PROMPT=0`) so an unattended run cannot block, and the child locale is pinned
+to `LC_ALL=C` so that the reason text of a refused ref update is always the same.
 
 ## 7. Usage
 
@@ -147,7 +171,10 @@ final report, then processes every discovered repository.
 Process exit status:
 
 * `0` – every discovered repository synchronized and every ref is in place (up-to-date refs count as
-  success), and discovery was complete.
+  success), and discovery was complete. A source ref that was deliberately left as it was — because
+  GitHub rewrote a branch or moved a tag, or because GitHub no longer has the ref — counts as
+  success too: refusing the rewrite is the intended result, and the report names every affected
+  ref.
 * `1` – at least one repository or ref failed, a project-name collision occurred, a visibility
   discrepancy was found, discovery was incomplete, or authentication/tool checks failed.
 * `2` – command line arguments were supplied.
@@ -190,23 +217,50 @@ makes the exit status nonzero.
 
 ## 10. Branch and tag handling
 
-### Fetching: one command per repository
+### Fetching: branches with one command, tags one refspec at a time
 
-Each repository is fetched exactly once per run, with both explicit refspecs in that one command:
+The persistent bare repository is a second copy of GitHub's history, so it refuses to take over a
+rewritten one. Branches are fetched with one non-forced wildcard:
 
 ```sh
-git fetch --quiet --no-tags github \
-  '+refs/heads/*:refs/nonforceful-github/heads/*' \
-  '+refs/tags/*:refs/nonforceful-github/tags/*'
+git fetch --no-tags --no-prune --no-prune-tags github \
+  'refs/heads/*:refs/nonforceful-github/heads/*'
 ```
 
-Every branch and every tag — lightweight and annotated — therefore lands in the private
-source-tracking namespaces in a single network round trip. The leading `+` applies **only** to
-those local namespaces: it lets them follow a rewritten GitHub history, and it can never force
-anything on GitLab. `--no-tags` stops Git from quietly adding tags outside the explicit refspec;
-the tag refspec itself is what retrieves them. `--prune` and `--prune-tags` are never used: a
-source ref that disappears on GitHub is *not* proof of anything until the pre-fetch `git ls-remote`
-of the source has succeeded, and even then the destination keeps the ref (it is reported as stale).
+No `+`, no `--force`. Git therefore updates a branch only when the new value is a fast-forward of
+the old one. When GitHub was rewritten, Git refuses the update, prints
+`! [rejected] ... (non-fast-forward)`, the source-tracking ref keeps the value it had, and the run
+reports the refusal per branch. That is the whole protection: the rewritten history never enters the
+workspace, so it can never reach GitLab either.
+
+Tags are treated differently on purpose. A wildcard tag refspec would be applied by Git to tags
+that already exist, and Git accepts a tag that moved **forward** to a descendant commit as an
+ordinary fast-forward update — no `+` needed. A wildcard would therefore replace an existing tag
+silently. Instead, the tag listing is compared with the local tags first:
+
+* a tag GitHub has and the workspace does not → fetched with one explicit refspec
+  `refs/tags/<name>:refs/nonforceful-github/tags/<name>`, 200 per command;
+* a tag that is identical on both sides → nothing to do;
+* a tag that exists locally at a different object → **not fetched at all**, reported
+  `update refused (upstream tag moved)`, and the local tag keeps its object;
+* a local tag GitHub no longer has → reported `kept (GitHub no longer has it)` and kept.
+
+Every tag is therefore fetched exactly once, ever, and no tag update — fast-forward or not — can
+replace an existing local tag.
+
+`--no-tags` stops Git from quietly adding tags outside the tracking namespace. `--no-prune` and
+`--no-prune-tags` are passed explicitly so that a global `fetch.prune`/`fetch.pruneTags` cannot
+prune a tracking ref; the program never prunes either. A source ref that disappears on GitHub is
+reported, never deleted, and its GitLab counterpart is left in place.
+
+### Fetch outcomes are decisions, not guesses
+
+Whether a ref was created, updated, refused or kept is decided by comparing object ids — the
+`git ls-remote` listing of GitHub, the tracking namespace read before the fetch, and the namespace
+read afterwards — never by parsing console text. Git's status table is only used for the *reason*
+text of a refusal, and only after the comparison has already established that the update was
+refused. `LC_ALL=C` is set for every child process so that reason classification does not depend on
+the machine's language.
 
 ### Pushing: one command per namespace
 
@@ -262,6 +316,22 @@ rather than by mislabelling the refs:
 
 Removed source refs are never deleted on GitLab; they are listed as stale destination refs.
 
+Fetch results appear in the same report block, in the same shape, above the push lines:
+
+```
+  fetch: 3 branch(es), 2 tag(s) (1 created, 1 updated, 1 unchanged, 1 refused, 1 kept without a GitHub ref)
+    source branch dev: update refused (non-fast-forward) [GitHub rewrote the branch; the local tracking ref and the GitLab branch were kept]
+    source tag v1: update refused (upstream tag moved) [GitHub moved the tag; the local tag and the GitLab tag were kept]
+    source tag old: kept (GitHub no longer has it) [GitHub no longer has this tag; the local and GitLab copies were kept]
+```
+
+Only refs that were refused, kept, or failed are listed; `created`, `updated` and
+`already up to date` are counted in the header. A refusal is **not** a failure of the run: the
+mirror is in the state it is designed to be in, so the repository stays `synchronized` and the exit
+status is unaffected. A ref that could not be fetched at all (transport, permissions) *is* a
+failure: it is listed as `failed`, the remaining refs are still pushed, and the repository is
+counted as completed-with-failures.
+
 ## 11. Project lookup, creation and collisions
 
 * Projects are looked up before they are created, with `GET /projects/:full_path`.
@@ -299,12 +369,15 @@ After every repository has been processed the program prints:
 * tags pushed (and how many were already up to date) and tag conflicts/failures,
 * how many `git push` processes were needed, with the branch/tag split — two per repository is the
   norm, one per namespace, regardless of the number of refs,
+* how many source ref updates were refused because GitHub rewrote a branch or moved a tag, and how
+  many source refs GitHub no longer has (both are informational: those refs are kept),
 * the number of name collisions,
 * a per-repository block for **every** discovered repository, including skipped and failed ones, with
   its project outcome, local repository state, fetch result, one line per branch and per tag, stale
   destination refs, notes and the error category. A push command that failed *as a whole* is shown
   on its own `branch push failed [...]` / `tag push failed [...]` line, next to — never instead of —
-  the per-ref lines it did report,
+  the per-ref lines it did report. Refused or kept *source* refs are listed as
+  `source <kind> <name>: ...` lines inside the same block, and are never counted as failures,
 * a phase timing block with the wall-clock cost of repository discovery, local repository setup,
   source fetch, destination ref listing, the bulk branch push, the bulk tag push, report generation,
   and the total before the report was rendered.
@@ -313,6 +386,71 @@ After every repository has been processed the program prints:
 
 No test suite, test framework or test dependency is shipped. Verification was performed manually
 during development with throw-away harnesses.
+
+### Non-forced fetch rework: local integration checks (no network, no credentials)
+
+Two throw-away harnesses were used. The first links the real `GitWorkspace` (with the real
+`ProcessRunner`) against local bare repositories that stand in for GitHub and GitLab, and passes a
+`git` wrapper as the executable so that **every argument vector the application passes to Git is
+recorded and audited**. 1227 checks, built with `-fsanitize=address,undefined`, all green:
+
+* the branch fetch refspec is exactly `refs/heads/*:refs/nonforceful-github/heads/*`; no recorded
+  `fetch` or `push` argument starts with `+`, and none is `--force`, `-f`, `--force-with-lease`,
+  `--prune`, `--prune-tags`, `--mirror`, `--delete`, `--tags` or `--all`; every fetch carries
+  `--no-prune` and `--no-tags`;
+* a tag wildcard refspec (`refs/tags/*`) is never passed to Git, and each of the five tags used
+  during the run appears in exactly one tag refspec — a tag is fetched once, ever;
+* `prepare()` removes the forced refspecs `git remote add` writes, so the workspace has neither a
+  `remote.github.fetch` nor `refs/remotes/*`, and the first fetch creates only the tracking
+  namespace;
+* first fetch: 1 branch and 2 tags created, one annotated tag stored as its tag object (id compared
+  with GitHub's), 2 `git fetch` processes (one branch fetch, one tag batch);
+* ordinary fast-forward: the branch is reported `updated`, the tracking ref advances to GitHub's
+  object id, and only one fetch process runs when there is nothing new to fetch;
+* upstream rewrite (`git commit --amend` + force-push): reported `update refused
+  (non-fast-forward)`, the tracking ref keeps its previous object id, and the branch is still in the
+  push list so a missing destination copy would be filled from the backup;
+* a tag moved **forward** (the case a wildcard refspec would accept silently): reported `update
+  refused (upstream tag moved)`, local tag unchanged, and no fetch of that tag is ever attempted;
+* a tag moved **backwards**: same result;
+* a brand-new annotated tag: created, tag object preserved;
+* a branch and a tag deleted on GitHub: reported `kept (GitHub no longer has it)`, the complete
+  tracking-ref inventory is byte-identical before and after, both are excluded from the push lists,
+  and nothing is deleted;
+* a partial fetch (one rewritten branch plus one new branch in the same command): the new branch is
+  created, the rewrite is refused, the fetch is still `succeeded` and both refs stay in the push
+  list;
+* a repeated fetch is idempotent (nothing created or updated) and keeps reporting the pending
+  refusals;
+* the push side is unchanged: a divergent destination branch is `rejected (non-fast-forward)` and
+  its object id is untouched, and a conflicting destination tag is `rejected (conflicting tag)` and
+  untouched;
+* a source remote that cannot be listed makes the fetch fail cleanly (no refs, nothing pushed);
+* the fetch status parser, on captured real output and on synthetic lines: the `!`, `*`, `-` and
+  unmarked fast-forward rows, the `(reason)` split, and `fatal:` lines.
+
+The second harness runs the shipped binary end to end against stub `gh`/`glab` executables and local
+bare repositories (no network, no credentials), four runs of one repository:
+
+1. **fresh**: project created, 1 branch and 2 tags pushed, `Source updates refused ...: 0`, exit
+   status 0; the workspace has no `remote.github.fetch` and no `refs/remotes` namespace, and
+   `refs/remotes/gitlab/*` is *not* created by the push (see below);
+2. **GitHub rewrite**: reported as `source branch main: update refused (non-fast-forward)`, the
+   GitLab branch still holds the pre-rewrite commit, the workspace backup matches it, and the exit
+   status is still 0 — a refused rewrite is the intended state, not a failure;
+3. **destination divergence**: `branch main: rejected (non-fast-forward)`,
+   `Branch conflicts/failures: 1`, exit status 1, and the destination keeps its history;
+4. **GitHub tag deletion**: `tag light: kept (GitHub no longer has it)`, and the tag survives in
+   both the workspace and GitLab.
+
+Two facts were established empirically while building this, because they decide the design:
+
+* a non-forced **tag** wildcard does not protect an existing tag: when the new tag target is a
+  descendant of the old one, `git fetch` prints an ordinary fast-forward line and moves the ref.
+  Only not fetching the tag can protect it;
+* `git push` to a *local* remote applies that remote's configured (forced) fetch refspec, so
+  `refs/remotes/gitlab/<branch>` was silently moved by a push. Removing the forced refpecs of both
+  remotes is what stops it.
 
 ### Bulk push rework: local integration checks (no network, no credentials)
 
@@ -336,8 +474,9 @@ in for GitHub and GitLab; 92 checks, all asserted against actual destination ref
   conflicting destination tag is not overwritten;
 * destination-only branches and tags are reported as stale, left in place, and a push over unchanged
   refs leaves the destination inventory bit-identical;
-* a branch deleted on GitHub is dropped from the source-tracking namespace, is no longer enumerated,
-  and its destination branch survives and is reported stale;
+* a branch deleted on GitHub was dropped from the source-tracking namespace in that revision (the
+  later non-forced fetch rework keeps it instead), was no longer enumerated, and its destination
+  branch survived and was reported stale;
 * a failed fetch returns no refs (so nothing is pushed for it) and leaves every destination ref
   untouched;
 * an empty ref list launches no Git process at all;
@@ -406,8 +545,9 @@ following were asserted against actual destination refs and object ids, not cons
   tag is unchanged;
 * stale destination branches and tags are reported and left in place;
 * a rejection does not prevent later refs (and later repositories) from being pushed;
-* a branch deleted on the source is no longer enumerated, is dropped from the private tracking
-  namespace, and its destination branch survives;
+* a branch deleted on the source was no longer enumerated and was dropped from the private tracking
+  namespace in that revision (the later non-forced fetch rework keeps it), and its destination
+  branch survived;
 * a source repository with no refs at all is handled;
 * a workspace belonging to a different repository is rejected and left untouched;
 * workspace naming is deterministic and distinguishes owners/names differing only in case.
@@ -441,6 +581,12 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
 
 ### Not verified
 
+* No authenticated run against github.com or gitlab.com was performed for the non-forced fetch
+  rework: every check above uses local bare repositories, because the behaviour under test
+  (refusal of a rewritten branch or a moved tag, retention of deleted refs) is entirely local Git
+  semantics and provoking it on a real forge would mean force-pushing over a real repository. The
+  push side of the same binary was verified against gitlab.com in the earlier rework (below) and is
+  unchanged by this one.
 * Windows and macOS builds were not executed; the code path is portable C++17 with no
   platform-specific API calls, but only Linux was compiled and run.
 * A GitLab instance other than gitlab.com was not exercised.
@@ -472,6 +618,16 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
   submodules are out of scope.
 * The mirror is deliberately not exact when the source is rewritten or refs are deleted, for the
   safety reasons described above.
+* A rewritten branch or a moved tag stays refused on **every** run until it is resolved by hand: the
+  workspace never accepts the new history, so it never reaches GitLab either. The report says so on
+  each run. Resolving it means deleting the source-tracking ref and the GitLab ref (or resetting the
+  GitLab ref) yourself.
+* Concurrent runs of the program against the same data directory are not supported: there is no
+  lock, and two runs would fetch into the same tracking namespace. (Two runs racing on the *first*
+  fetch of a brand-new tag could, in principle, let one of them apply a tag update the other did not
+  expect; the sequential design has no such window.)
+* `refs/remotes/<remote>/*` refs written by earlier versions of this program are left in place —
+  nothing is ever deleted — but they are no longer created or updated.
 
 ## 15. Source layout
 
@@ -484,7 +640,8 @@ src/processrunner.h/.cpp           Boost.Process based subprocess abstraction
 src/githubdiscovery.h/.cpp         paginated GitHub repository discovery
 src/githubrepository.h             repository metadata
 src/gitlabproject.h/.cpp           GitLab project lookup and creation
-src/gitworkspace.h/.cpp            bare workspaces, one bulk fetch and two bulk non-forced pushes
+src/gitworkspace.h/.cpp            bare workspaces, non-forced fetch, two bulk non-forced pushes
+src/fetchstatus.h/.cpp             parser for the reason text of git fetch status lines
 src/pushporcelain.h/.cpp           parser for git push --porcelain ref status lines
 src/storage.h/.cpp                 PlatformFolders based data directory and workspace naming
 src/syncresult.h/.cpp              structured result types

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <system_error>
 
+#include "fetchstatus.h"
 #include "pushporcelain.h"
 #include "textutil.h"
 
@@ -21,8 +22,16 @@ constexpr const char* trackingBranchPrefix = "refs/nonforceful-github/heads/";
 constexpr const char* trackingTagPrefix = "refs/nonforceful-github/tags/";
 constexpr const char* destinationBranchPrefix = "refs/heads/";
 constexpr const char* destinationTagPrefix = "refs/tags/";
-constexpr const char* branchRefspec = "+refs/heads/*:refs/nonforceful-github/heads/*";
-constexpr const char* tagRefspec = "+refs/tags/*:refs/nonforceful-github/tags/*";
+// The fetch refspec for branches carries no leading '+': the persistent bare repository is a
+// backup of GitHub, so a rewritten upstream branch must be refused by Git instead of being taken
+// over. Ordinary fast-forward updates are still accepted.
+constexpr const char* branchRefspec = "refs/heads/*:refs/nonforceful-github/heads/*";
+// Tags are handled differently on purpose. Git applies a wildcard refspec to every tag that
+// already exists, and a tag that moved *forward* (to a descendant commit) is accepted as an
+// ordinary fast-forward update even without a '+'. A tag wildcard would therefore silently
+// replace an existing tag. Instead, each tag is fetched with its own explicit refspec, and only
+// while the local tag does not exist yet; an existing tag is never fetched again.
+constexpr std::size_t tagFetchBatchSize = 200;
 // Push refspecs carry no leading '+': these destinations must never be forced.
 constexpr const char* branchPushRefspec = "refs/nonforceful-github/heads/*:refs/heads/*";
 constexpr const char* tagPushRefspec = "refs/nonforceful-github/tags/*:refs/tags/*";
@@ -66,34 +75,47 @@ bool remoteMatchesRepository(const std::string& url, const GitHubRepository& rep
   return equalsIgnoreCase(remoteRepositorySuffix(url), repository.fullName);
 }
 
-/// A push argument list must never contain a destructive or forced option, and never a
-/// refspec that asks Git to force the destination.
-void ensureNonForcedArguments(const std::vector<std::string>& arguments) {
+/// A Git argument list must never contain a destructive or forced option, and never a refspec that
+/// asks Git to force or prune a ref. This covers both `git fetch` and `git push`.
+void ensureNonDestructiveArguments(const std::string& operation,
+                                   const std::vector<std::string>& arguments) {
   for (const std::string& argument : arguments) {
     const bool forbidden = argument == "-f" || argument == "--force" ||
                            argument == "--force-with-lease" ||
                            startsWith(argument, "--force-with-lease=") ||
                            startsWith(argument, "--force") || argument == "--mirror" ||
                            argument == "--delete" || argument == "--prune" ||
-                           argument == "--tags" || argument == "--all";
+                           argument == "--prune-tags" || argument == "--tags" ||
+                           argument == "--all" || argument == "--update-head-ok";
     if (forbidden) {
-      throw std::logic_error("refusing to run a destructive git push: " + argument);
+      throw std::logic_error("refusing to run a destructive " + operation + ": " + argument);
     }
     // A leading '+' in a refspec is the short spelling of --force.
     if (!argument.empty() && argument.front() == '+') {
-      throw std::logic_error("refusing to run a forced git push: " + argument);
+      throw std::logic_error("refusing to run a forced " + operation + ": " + argument);
     }
   }
 }
 
-RefPushState classifyRejection(const std::string& detail, RefKind kind) {
+/// The refspec that brings one named upstream tag into the source-tracking namespace. It is only
+/// ever handed to Git for a tag that is not present locally yet.
+std::string tagFetchRefspec(const std::string& name) {
+  return std::string("refs/tags/") + name + ":" + trackingTagPrefix + name;
+}
+
+/// True when a fetch was refused because the upstream branch was rewritten.
+bool isNonFastForwardReason(const std::string& detail) {
   const std::string lowered = toLowerAscii(detail);
-  if (lowered.find("non-fast-forward") != std::string::npos ||
-      lowered.find("fetch first") != std::string::npos ||
-      lowered.find("non-fast forward") != std::string::npos) {
+  return lowered.find("non-fast-forward") != std::string::npos ||
+         lowered.find("fetch first") != std::string::npos ||
+         lowered.find("non-fast forward") != std::string::npos;
+}
+
+RefPushState classifyRejection(const std::string& detail, RefKind kind) {
+  if (isNonFastForwardReason(detail)) {
     return RefPushState::rejectedNonFastForward;
   }
-  if (lowered.find("already exists") != std::string::npos && kind == RefKind::tag) {
+  if (toLowerAscii(detail).find("already exists") != std::string::npos && kind == RefKind::tag) {
     return RefPushState::rejectedTagConflict;
   }
   return RefPushState::failed;
@@ -205,7 +227,8 @@ LocalRepositoryResult GitWorkspace::prepare(const GitHubRepository& repository,
     }
 
     if (!ensureRemote(repositoryPath, sourceRemote, repository.cloneUrl, result.repairs) ||
-        !ensureRemote(repositoryPath, destinationRemote, destinationUrl, result.repairs)) {
+        !ensureRemote(repositoryPath, destinationRemote, destinationUrl, result.repairs) ||
+        !clearConfiguredFetchRefspecs(repositoryPath, result.repairs)) {
       result.error = "cannot configure the remotes of " + repositoryPath.string();
       result.category = ErrorCategory::gitCommand;
       return result;
@@ -252,6 +275,11 @@ LocalRepositoryResult GitWorkspace::prepare(const GitHubRepository& repository,
     result.category = ErrorCategory::gitCommand;
     return result;
   }
+  if (!clearConfiguredFetchRefspecs(repositoryPath, result.repairs)) {
+    result.error = "cannot remove the forced fetch refspecs of " + repositoryPath.string();
+    result.category = ErrorCategory::gitCommand;
+    return result;
+  }
   if (!configSet(repositoryPath, sourceRepositoryConfigKey, repository.fullName) ||
       !configSet(repositoryPath, gitlabProjectConfigKey, destinationUrl)) {
     result.error = "cannot record the repository identity in " + repositoryPath.string();
@@ -293,6 +321,60 @@ GitWorkspace::RemoteRefList GitWorkspace::listRemoteRefs(
   return listing;
 }
 
+GitWorkspace::TrackingRefList GitWorkspace::listTrackingRefs(
+    const std::filesystem::path& repositoryPath) const {
+  TrackingRefList listing;
+  const ProcessResult listed =
+      runner_.run(gitExecutable_,
+                  {"for-each-ref", "--format=%(objectname) %(refname)", trackingRoot},
+                  repositoryPath);
+  if (!listed.succeeded()) {
+    listing.error = listed.diagnostic();
+    return listing;
+  }
+
+  for (const std::string& line : splitLines(listed.standardOutput)) {
+    const std::string trimmed = trim(line);
+    const std::size_t space = trimmed.find(' ');
+    if (trimmed.empty() || space == std::string::npos) {
+      continue;
+    }
+    TrackingRef ref{trimmed.substr(0, space), trim(trimmed.substr(space + 1))};
+    if (!startsWith(ref.name, trackingRoot)) {
+      continue;
+    }
+    listing.refs.push_back(std::move(ref));
+  }
+  listing.ok = true;
+  return listing;
+}
+
+bool GitWorkspace::clearConfiguredFetchRefspecs(const std::filesystem::path& repositoryPath,
+                                                std::vector<std::string>& repairs) const {
+  return clearConfiguredFetchRefspec(repositoryPath, sourceRemote, repairs) &&
+         clearConfiguredFetchRefspec(repositoryPath, destinationRemote, repairs);
+}
+
+bool GitWorkspace::clearConfiguredFetchRefspec(const std::filesystem::path& repositoryPath,
+                                               const std::string& remote,
+                                               std::vector<std::string>& repairs) const {
+  const std::string key = "remote." + remote + ".fetch";
+  if (configGet(repositoryPath, key).empty()) {
+    return true;
+  }
+  // `git remote add` writes "+refs/heads/*:refs/remotes/<remote>/*", a *forced* refspec into a
+  // namespace this program never reads. It is cleared on both remotes: clearing the source one
+  // keeps every fetch free of forced updates, and clearing the destination one stops Git from
+  // quietly rewriting refs/remotes/gitlab/* when a push targets a local repository.
+  const ProcessResult cleared =
+      runner_.run(gitExecutable_, {"config", "--unset-all", key}, repositoryPath);
+  if (!cleared.succeeded()) {
+    return configGet(repositoryPath, key).empty();
+  }
+  repairs.push_back("removed the default forced fetch refspec of remote '" + remote + "'");
+  return true;
+}
+
 FetchResult GitWorkspace::fetchAll(const GitHubRepository& repository,
                                    const std::filesystem::path& repositoryPath) const {
   FetchResult result;
@@ -305,60 +387,223 @@ FetchResult GitWorkspace::fetchAll(const GitHubRepository& repository,
     return result;
   }
 
-  std::vector<std::string> fetchArguments = credentialArguments(false);
-  fetchArguments.insert(fetchArguments.end(),
-                        {"fetch", "--quiet", "--no-tags", sourceRemote, branchRefspec, tagRefspec});
-  const ProcessResult fetched = runner_.run(gitExecutable_, fetchArguments, repositoryPath);
-  if (!fetched.succeeded()) {
-    result.error = "fetching from GitHub failed: " + fetched.diagnostic();
+  std::map<std::string, std::string> remoteBranches;
+  std::map<std::string, std::string> remoteTags;
+  for (const RemoteRef& ref : remote.refs) {
+    if (startsWith(ref.name, destinationBranchPrefix)) {
+      remoteBranches.emplace(ref.name.substr(std::string(destinationBranchPrefix).size()),
+                             ref.objectId);
+    } else if (startsWith(ref.name, destinationTagPrefix)) {
+      remoteTags.emplace(ref.name.substr(std::string(destinationTagPrefix).size()), ref.objectId);
+    }
+  }
+
+  const TrackingRefList before = listTrackingRefs(repositoryPath);
+  if (!before.ok) {
+    result.error = "listing the source-tracking refs failed: " + before.error;
+    result.category = ErrorCategory::gitCommand;
+    return result;
+  }
+  const auto toMap = [](const TrackingRefList& list) {
+    std::map<std::string, std::string> mapped;
+    for (const TrackingRef& ref : list.refs) {
+      mapped.emplace(ref.name, ref.objectId);
+    }
+    return mapped;
+  };
+  const std::map<std::string, std::string> trackingBefore = toMap(before);
+
+  // One non-forced wildcard fetch for every branch. Git accepts ordinary fast-forward updates and
+  // refuses a rewritten branch, which leaves the existing source-tracking ref untouched.
+  std::vector<std::string> branchArguments = credentialArguments(false);
+  branchArguments.insert(branchArguments.end(), {"fetch", "--no-tags", "--no-prune",
+                                                 "--no-prune-tags", sourceRemote, branchRefspec});
+  ensureNonDestructiveArguments("git fetch", branchArguments);
+  const ProcessResult fetchedBranches = runner_.run(gitExecutable_, branchArguments, repositoryPath);
+  ++result.commands;
+  const FetchStatusParse branchStatus = parseFetchStatus(fetchedBranches.standardError);
+
+  const TrackingRefList afterBranches = listTrackingRefs(repositoryPath);
+  if (!afterBranches.ok) {
+    result.error = "listing the source-tracking refs failed: " + afterBranches.error;
+    result.category = ErrorCategory::gitCommand;
+    return result;
+  }
+  std::map<std::string, std::string> tracking = toMap(afterBranches);
+
+  std::size_t refusedBranches = 0;
+  std::size_t failedBranches = 0;
+  for (const auto& entry : remoteBranches) {
+    const std::string& name = entry.first;
+    const std::string& remoteObject = entry.second;
+    const std::string trackingName = trackingRef(RefKind::branch, name);
+
+    FetchRefResult ref;
+    ref.name = name;
+    ref.kind = RefKind::branch;
+
+    const auto previous = trackingBefore.find(trackingName);
+    const auto current = tracking.find(trackingName);
+    const bool hadPrevious = previous != trackingBefore.end();
+
+    if (current == tracking.end()) {
+      ref.state = FetchRefState::failed;
+      ref.detail = "the source-tracking ref is missing after the fetch";
+    } else if (current->second == remoteObject) {
+      if (!hadPrevious) {
+        ref.state = FetchRefState::created;
+      } else {
+        ref.state = previous->second == remoteObject ? FetchRefState::upToDate
+                                                     : FetchRefState::updated;
+      }
+    } else if (hadPrevious && previous->second == current->second) {
+      // The local ref still holds the value it had before the fetch, so Git refused the update.
+      const std::string reason = branchStatus.reasonFor(trackingName);
+      if (reason.empty() || isNonFastForwardReason(reason)) {
+        ref.state = FetchRefState::refusedNonFastForward;
+        ref.detail = "GitHub rewrote the branch; the local tracking ref and the GitLab branch "
+                     "were kept";
+      } else {
+        ref.state = FetchRefState::failed;
+        ref.detail = reason;
+      }
+    } else {
+      ref.state = FetchRefState::failed;
+      ref.detail = "the source-tracking ref did not reach the value GitHub reports";
+    }
+
+    if (ref.state == FetchRefState::failed) {
+      ++failedBranches;
+    } else if (ref.state == FetchRefState::refusedNonFastForward) {
+      ++refusedBranches;
+    }
+    result.refs.push_back(std::move(ref));
+  }
+
+  // A fetch that could not run at all, or that reported a fatal diagnostic, leaves nothing that can
+  // be trusted: the repository is reported as failed instead of being pushed.
+  const bool branchFetchFatal =
+      !fetchedBranches.launched || !branchStatus.fatalLines.empty();
+  if (branchFetchFatal || (!fetchedBranches.succeeded() && refusedBranches == 0 &&
+                          failedBranches == 0)) {
+    result.error = "fetching the GitHub branches failed: " + fetchedBranches.diagnostic();
     result.category = ErrorCategory::gitCommand;
     return result;
   }
 
-  std::set<std::string> expected;
-  for (const RemoteRef& ref : remote.refs) {
-    if (startsWith(ref.name, destinationBranchPrefix) || startsWith(ref.name, destinationTagPrefix)) {
-      expected.insert(ref.name);
+  // Tags: an existing tag is never fetched again. Git treats a tag that moved forward as an
+  // ordinary fast-forward update, so fetching it -- with or without a forced refspec -- would
+  // replace the local tag. A moved tag is reported instead, and the local tag keeps its value.
+  std::vector<std::string> newTags;
+  for (const auto& entry : remoteTags) {
+    const std::string& name = entry.first;
+    const std::string& remoteObject = entry.second;
+    const std::string trackingName = trackingRef(RefKind::tag, name);
+
+    const auto current = tracking.find(trackingName);
+    if (current == tracking.end()) {
+      newTags.push_back(name);
+      continue;
     }
+
+    FetchRefResult ref;
+    ref.name = name;
+    ref.kind = RefKind::tag;
+    if (current->second == remoteObject) {
+      ref.state = FetchRefState::upToDate;
+    } else {
+      ref.state = FetchRefState::refusedTagMoved;
+      ref.detail = "GitHub moved the tag; the local tag and the GitLab tag were kept";
+    }
+    result.refs.push_back(std::move(ref));
   }
 
-  // Drop source-tracking refs whose GitHub ref has disappeared. Only the application's own
-  // namespace is touched: no object, branch or tag is ever deleted.
-  const ProcessResult tracked =
-      runner_.run(gitExecutable_, {"for-each-ref", "--format=%(refname)", trackingRoot},
-                  repositoryPath);
-  if (tracked.succeeded()) {
-    for (const std::string& localRef : splitLines(tracked.standardOutput)) {
-      const std::string name = trim(localRef);
-      if (name.empty() || !startsWith(name, trackingRoot)) {
-        continue;
-      }
-      std::string remoteRef;
-      if (startsWith(name, trackingBranchPrefix)) {
-        remoteRef = destinationBranchPrefix + name.substr(std::string(trackingBranchPrefix).size());
-      } else if (startsWith(name, trackingTagPrefix)) {
-        remoteRef = destinationTagPrefix + name.substr(std::string(trackingTagPrefix).size());
+  for (std::size_t start = 0; start < newTags.size(); start += tagFetchBatchSize) {
+    const std::size_t end = std::min(start + tagFetchBatchSize, newTags.size());
+
+    std::vector<std::string> tagArguments = credentialArguments(false);
+    tagArguments.insert(tagArguments.end(),
+                        {"fetch", "--no-tags", "--no-prune", "--no-prune-tags", sourceRemote});
+    for (std::size_t index = start; index < end; ++index) {
+      tagArguments.push_back(tagFetchRefspec(newTags[index]));
+    }
+    ensureNonDestructiveArguments("git fetch", tagArguments);
+    const ProcessResult fetchedTags = runner_.run(gitExecutable_, tagArguments, repositoryPath);
+    ++result.commands;
+    const FetchStatusParse tagStatus = parseFetchStatus(fetchedTags.standardError);
+
+    const TrackingRefList listed = listTrackingRefs(repositoryPath);
+    if (listed.ok) {
+      tracking = toMap(listed);
+    }
+
+    for (std::size_t index = start; index < end; ++index) {
+      const std::string& name = newTags[index];
+      const std::string trackingName = trackingRef(RefKind::tag, name);
+      const std::string& remoteObject = remoteTags.at(name);
+
+      FetchRefResult ref;
+      ref.name = name;
+      ref.kind = RefKind::tag;
+      const auto current = tracking.find(trackingName);
+      if (current != tracking.end() && current->second == remoteObject) {
+        ref.state = FetchRefState::created;
       } else {
+        ref.state = FetchRefState::failed;
+        const std::string reason = tagStatus.reasonFor(trackingName);
+        ref.detail = reason.empty() ? fetchedTags.diagnostic() : reason;
+      }
+      result.refs.push_back(std::move(ref));
+    }
+  }
+
+  // Refs that GitHub no longer has are kept: they are the backup of a history that once existed,
+  // and the GitLab copy of them is left in place as well.
+  for (const auto& entry : tracking) {
+    const std::string& trackingName = entry.first;
+    if (startsWith(trackingName, trackingBranchPrefix)) {
+      const std::string name = trackingName.substr(std::string(trackingBranchPrefix).size());
+      if (remoteBranches.count(name) != 0) {
         continue;
       }
-      if (expected.find(remoteRef) != expected.end()) {
+      FetchRefResult ref;
+      ref.name = name;
+      ref.kind = RefKind::branch;
+      ref.state = FetchRefState::retained;
+      ref.detail = "GitHub no longer has this branch; the local and GitLab copies were kept";
+      result.refs.push_back(std::move(ref));
+    } else if (startsWith(trackingName, trackingTagPrefix)) {
+      const std::string name = trackingName.substr(std::string(trackingTagPrefix).size());
+      if (remoteTags.count(name) != 0) {
         continue;
       }
-      if (runner_.run(gitExecutable_, {"update-ref", "-d", name}, repositoryPath).succeeded()) {
-        ++result.prunedTrackingRefs;
+      FetchRefResult ref;
+      ref.name = name;
+      ref.kind = RefKind::tag;
+      ref.state = FetchRefState::retained;
+      ref.detail = "GitHub no longer has this tag; the local and GitLab copies were kept";
+      result.refs.push_back(std::move(ref));
+    }
+  }
+
+  // Only refs that exist locally after the fetch are pushed, so a tag whose fetch failed is
+  // reported as such instead of being pushed from a missing source ref.
+  for (const auto& entry : tracking) {
+    const std::string& trackingName = entry.first;
+    if (startsWith(trackingName, trackingBranchPrefix)) {
+      const std::string name = trackingName.substr(std::string(trackingBranchPrefix).size());
+      if (remoteBranches.count(name) != 0) {
+        result.branches.push_back(name);
+      }
+    } else if (startsWith(trackingName, trackingTagPrefix)) {
+      const std::string name = trackingName.substr(std::string(trackingTagPrefix).size());
+      if (remoteTags.count(name) != 0) {
+        result.tags.push_back(name);
       }
     }
   }
 
-  for (const RemoteRef& ref : remote.refs) {
-    if (startsWith(ref.name, destinationBranchPrefix)) {
-      result.branches.push_back(ref.name.substr(std::string(destinationBranchPrefix).size()));
-    } else if (startsWith(ref.name, destinationTagPrefix)) {
-      result.tags.push_back(ref.name.substr(std::string(destinationTagPrefix).size()));
-    }
-  }
-
-  result.state = FetchState::succeeded;
+  result.state = result.hasRefFailures() ? FetchState::partial : FetchState::succeeded;
   return result;
 }
 
@@ -383,7 +628,7 @@ BulkPushResult GitWorkspace::pushAll(const std::filesystem::path& repositoryPath
   const std::string refspec = kind == RefKind::branch ? branchPushRefspec : tagPushRefspec;
   std::vector<std::string> arguments = credentialArguments(true);
   arguments.insert(arguments.end(), {"push", "--porcelain", destinationRemote, refspec});
-  ensureNonForcedArguments(arguments);
+  ensureNonDestructiveArguments("git push", arguments);
 
   const auto started = std::chrono::steady_clock::now();
   const ProcessResult response = runner_.run(gitExecutable_, arguments, repositoryPath);

@@ -48,6 +48,44 @@ std::string describe(RefPushState state) {
   return "failed";
 }
 
+std::string describe(FetchRefState state) {
+  switch (state) {
+    case FetchRefState::created:
+      return "created";
+    case FetchRefState::updated:
+      return "updated";
+    case FetchRefState::upToDate:
+      return "already up to date";
+    case FetchRefState::refusedNonFastForward:
+      return "update refused (non-fast-forward)";
+    case FetchRefState::refusedTagMoved:
+      return "update refused (upstream tag moved)";
+    case FetchRefState::retained:
+      return "kept (GitHub no longer has it)";
+    case FetchRefState::failed:
+      return "failed";
+  }
+  return "failed";
+}
+
+std::size_t FetchResult::countRefs(FetchRefState wanted) const {
+  std::size_t count = 0;
+  for (const FetchRefResult& ref : refs) {
+    if (ref.state == wanted) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t FetchResult::refusedRefs() const {
+  return countRefs(FetchRefState::refusedNonFastForward) + countRefs(FetchRefState::refusedTagMoved);
+}
+
+std::size_t FetchResult::retainedRefs() const { return countRefs(FetchRefState::retained); }
+
+bool FetchResult::hasRefFailures() const { return countRefs(FetchRefState::failed) != 0; }
+
 std::string describe(LocalRepositoryState state) {
   switch (state) {
     case LocalRepositoryState::created:
@@ -234,6 +272,30 @@ std::size_t RunResult::collisions() const {
     if (repository.category == ErrorCategory::collision) {
       ++count;
     }
+  }
+  return count;
+}
+
+std::size_t RunResult::sourceRefsRefused() const {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : repositories) {
+    count += repository.fetch.refusedRefs();
+  }
+  return count;
+}
+
+std::size_t RunResult::sourceRefsRetained() const {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : repositories) {
+    count += repository.fetch.retainedRefs();
+  }
+  return count;
+}
+
+std::size_t RunResult::fetchCommands() const {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : repositories) {
+    count += repository.fetch.commands;
   }
   return count;
 }

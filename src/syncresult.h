@@ -85,17 +85,66 @@ struct LocalRepositoryResult {
   bool ok() const { return state != LocalRepositoryState::invalid; }
 };
 
-enum class FetchState { succeeded, failed };
+/// Outcome of one ref update attempted by a fetch.
+enum class FetchRefState {
+  created,                ///< The source-tracking ref did not exist and was created.
+  updated,                ///< The source-tracking ref followed an ordinary fast-forward.
+  upToDate,               ///< The source-tracking ref already pointed at GitHub's object.
+  refusedNonFastForward,  ///< GitHub rewrote the branch; the source-tracking ref was kept.
+  refusedTagMoved,        ///< GitHub moved the tag; the local tag was never re-fetched.
+  retained,               ///< GitHub no longer has the ref; the source-tracking ref was kept.
+  failed                  ///< The ref could not be fetched (transport, permissions, ...).
+};
+
+std::string describe(FetchRefState state);
+
+struct FetchRefResult {
+  std::string name;
+  RefKind kind = RefKind::branch;
+  FetchRefState state = FetchRefState::failed;
+  std::string detail;
+
+  /// True when the ref was deliberately left alone instead of being updated.
+  bool refused() const {
+    return state == FetchRefState::refusedNonFastForward || state == FetchRefState::refusedTagMoved;
+  }
+};
+
+/// Result of fetching one repository.
+///
+/// A refused non-fast-forward update or a moved tag is a *success* of this phase, not a failure:
+/// the point of the non-forced fetch is that the existing source-tracking ref, which is also the
+/// backup of the previous GitHub history, survives. It is reported per ref so that the operator
+/// can see which upstream refs were rewritten.
+enum class FetchState {
+  succeeded,  ///< Every ref was fetched, or deliberately left as it was.
+  partial,    ///< A fetch command completed but at least one ref could not be fetched.
+  failed      ///< The fetch as a whole failed; the destination was not touched.
+};
 
 struct FetchResult {
   FetchState state = FetchState::failed;
+  /// Source refs that exist locally after the fetch and are therefore pushed to GitLab.
   std::vector<std::string> branches;
   std::vector<std::string> tags;
-  std::size_t prunedTrackingRefs = 0;
+  /// Per-ref outcomes, in listing order: one entry per GitHub branch and tag.
+  std::vector<FetchRefResult> refs;
+  /// Number of `git fetch` processes this repository needed (one for branches, one per batch of
+  /// new tags).
+  std::size_t commands = 0;
   std::string error;
   ErrorCategory category = ErrorCategory::none;
 
-  bool ok() const { return state == FetchState::succeeded; }
+  bool ok() const { return state != FetchState::failed; }
+
+  std::size_t countRefs(FetchRefState wanted) const;
+  /// Refs whose update was refused because GitHub rewrote or moved them.
+  std::size_t refusedRefs() const;
+  /// Refs that GitHub no longer has and that were kept as backup data.
+  std::size_t retainedRefs() const;
+
+  /// True when at least one ref could not be fetched at all.
+  bool hasRefFailures() const;
 };
 
 enum class ProjectOutcome { created, existing, failed };
@@ -121,7 +170,8 @@ struct ProjectResult {
 };
 
 enum class RepositoryState {
-  synchronized,           ///< Every requested ref is in place.
+  synchronized,           ///< Every requested ref is in place, or is deliberately left as it was
+                          ///< because GitHub rewrote it (a refusal, not a failure).
   completedWithFailures,  ///< Processing finished but at least one ref or step failed.
   skipped,                ///< Deliberately not touched (collision, foreign local repository).
   failed                  ///< The repository could not be processed at all.
@@ -181,6 +231,12 @@ struct RunResult {
   std::size_t tagsFailed() const;
   std::size_t tagsUpToDate() const;
   std::size_t collisions() const;
+  /// Upstream refs whose rewrite or tag move was refused, so the existing ref was kept.
+  std::size_t sourceRefsRefused() const;
+  /// Upstream refs that disappeared but whose local and GitLab copies were kept.
+  std::size_t sourceRefsRetained() const;
+  /// `git fetch` processes started over the whole run.
+  std::size_t fetchCommands() const;
   /// Newly created projects whose CI/CD was switched off (`builds_access_level=disabled`).
   std::size_t createdProjectsWithCiCdDisabled() const;
 
