@@ -19,8 +19,9 @@ For every repository returned by the GitHub REST endpoint `/user/repos` with
    project that was just created.
 2. Locate or create a persistent **bare** Git repository as the synchronization workspace.
 3. Fetch every GitHub branch and every GitHub tag into a private source-tracking namespace
-   (`refs/nonforceful-github/heads/*`, `refs/nonforceful-github/tags/*`).
-4. Push each branch and each tag to GitLab with an ordinary, non-forced `git push`.
+   (`refs/nonforceful-github/heads/*`, `refs/nonforceful-github/tags/*`) with a single `git fetch`.
+4. Push all branches with one ordinary, non-forced `git push` and all tags with another — one Git
+   process per repository and namespace, however many refs there are.
 5. Record the outcome per repository and per ref, continue with the next repository, and print a
    comprehensive report at the end.
 
@@ -31,9 +32,11 @@ can be missing.
 
 These are invariants of the implementation, not options:
 
-* No `git push --force`, `-f` or `--force-with-lease`. The only push invocation in the code base is
-  `git push --porcelain <remote> <src>:<dst>`, and a guard rejects any destructive option before a
-  process is started.
+* No `git push --force`, `-f` or `--force-with-lease`. The only push invocations in the code base
+  are `git push --porcelain <remote> refs/nonforceful-github/heads/*:refs/heads/*` and
+  `git push --porcelain <remote> refs/nonforceful-github/tags/*:refs/tags/*`, and a guard rejects
+  any destructive or forced option — and any refspec that starts with `+` — before a process is
+  started.
 * No `git reset --hard`, no `git clean`, no `--mirror`, no `--delete`, no `--prune`, no
   `gh repo sync --force`.
 * **Destination branches and tags are never deleted, never force-updated and never reset.** A
@@ -187,15 +190,77 @@ makes the exit status nonzero.
 
 ## 10. Branch and tag handling
 
-* Every branch is pushed as `refs/nonforceful-github/heads/<branch>` →
-  `refs/heads/<branch>`, one push per ref.
-* Every tag (lightweight and annotated) is pushed as `refs/nonforceful-github/tags/<tag>` →
-  `refs/tags/<tag>`. The original tag ref is pushed, so annotated tag objects and their messages are
-  preserved.
-* Push results are read from `git push --porcelain`: new/updated refs, `up to date`, `rejected
-  (non-fast-forward)` and `rejected (already exists)` are distinguished. Anything else is reported as
-  a generic failure, so a permission or transport error is never mistaken for a conflict.
-* Removed source refs are never deleted on GitLab; they are listed as stale destination refs.
+### Fetching: one command per repository
+
+Each repository is fetched exactly once per run, with both explicit refspecs in that one command:
+
+```sh
+git fetch --quiet --no-tags github \
+  '+refs/heads/*:refs/nonforceful-github/heads/*' \
+  '+refs/tags/*:refs/nonforceful-github/tags/*'
+```
+
+Every branch and every tag — lightweight and annotated — therefore lands in the private
+source-tracking namespaces in a single network round trip. The leading `+` applies **only** to
+those local namespaces: it lets them follow a rewritten GitHub history, and it can never force
+anything on GitLab. `--no-tags` stops Git from quietly adding tags outside the explicit refspec;
+the tag refspec itself is what retrieves them. `--prune` and `--prune-tags` are never used: a
+source ref that disappears on GitHub is *not* proof of anything until the pre-fetch `git ls-remote`
+of the source has succeeded, and even then the destination keeps the ref (it is reported as stale).
+
+### Pushing: one command per namespace
+
+Pushing costs one Git process per repository for branches and one for tags, no matter how many
+refs there are:
+
+```sh
+git push --porcelain gitlab 'refs/nonforceful-github/heads/*:refs/heads/*'
+git push --porcelain gitlab 'refs/nonforceful-github/tags/*:refs/tags/*'
+```
+
+* Both refspecs are passed as **single literal arguments**, and no shell is ever involved, so the
+  `*` is expanded by Git itself and can never be expanded by a command interpreter.
+* The left side is the local source-tracking ref fetched from GitHub, the right side the
+  destination ref of the same name; the wildcard maps each matching name to itself.
+* Branches and tags are separate commands so their results are classified independently. Neither
+  `--tags` nor a combined refspec is used as a substitute for the explicit tag-tracking namespace.
+* `--atomic` is not used: a single conflicting ref must not stop unrelated refs from being updated,
+  and Git already updates each ref independently.
+* The original tag ref is pushed, so annotated tag objects and their messages are preserved.
+
+### Reading the result
+
+Individual outcomes are taken from Git's documented machine-readable `--porcelain` output,
+`<flag> \t <from>:<to> \t <summary> (<reason>)`, never from human-readable or localised text.
+Every documented flag maps onto the existing per-ref model:
+
+| porcelain flag | Git meaning | reported as |
+| --- | --- | --- |
+| `' '` | fast-forward | `pushed` |
+| `'*'` | new branch or tag | `pushed` |
+| `'='` | already up to date | `already up to date` |
+| `'!'` + `(non-fast-forward)` or `(fetch first)` | branch update refused | `rejected (non-fast-forward)` |
+| `'!'` + `(already exists)` on a tag | tag already points elsewhere | `rejected (conflicting tag)` |
+| `'!'` + anything else (`remote rejected`, hook, permissions, transport) | other rejection | `failed` |
+| `'-'` | deletion | `failed` — a deletion is never requested |
+| `'+'` | forced update | `pushed`, **plus** an operation-level error (this program never forces) |
+| any other flag | undocumented | `unknown (git reported no result)` |
+
+The process exit status, standard output and standard error are captured separately. A non-zero
+exit status does **not** mean every ref failed: a push that carries one rejected and one updated
+ref exits non-zero and still reports the updated ref as `pushed`. Everything Git did report is
+kept, and a failure of the command as a whole is added as a *separate* operation-level error
+rather than by mislabelling the refs:
+
+* a push process that could not be started, or that failed before printing any ref line, produces
+  an operation-level error and leaves every requested ref `unknown`;
+* output lines that do not match the documented format, an undocumented status flag, or output
+  that ends without the final `Done` marker are reported as uncertainty — the affected refs stay
+  `unknown` and the raw line is quoted in the error instead of being interpreted;
+* a rejection that Git reported per ref needs no operation-level error at all: the per-ref line
+  already states exactly what happened.
+
+Removed source refs are never deleted on GitLab; they are listed as stale destination refs.
 
 ## 11. Project lookup, creation and collisions
 
@@ -232,15 +297,99 @@ After every repository has been processed the program prints:
 * GitLab projects created, and how many of them had CI/CD disabled,
 * branches pushed (and how many were already up to date) and branch conflicts/failures,
 * tags pushed (and how many were already up to date) and tag conflicts/failures,
+* how many `git push` processes were needed, with the branch/tag split — two per repository is the
+  norm, one per namespace, regardless of the number of refs,
 * the number of name collisions,
 * a per-repository block for **every** discovered repository, including skipped and failed ones, with
   its project outcome, local repository state, fetch result, one line per branch and per tag, stale
-  destination refs, notes and the error category.
+  destination refs, notes and the error category. A push command that failed *as a whole* is shown
+  on its own `branch push failed [...]` / `tag push failed [...]` line, next to — never instead of —
+  the per-ref lines it did report,
+* a phase timing block with the wall-clock cost of repository discovery, local repository setup,
+  source fetch, destination ref listing, the bulk branch push, the bulk tag push, report generation,
+  and the total before the report was rendered.
 
 ## 13. Verification performed during development
 
 No test suite, test framework or test dependency is shipped. Verification was performed manually
 during development with throw-away harnesses.
+
+### Bulk push rework: local integration checks (no network, no credentials)
+
+A second throw-away harness drove the real `GitWorkspace` against local bare repositories that stood
+in for GitHub and GitLab; 92 checks, all asserted against actual destination refs and object ids:
+
+* the porcelain parser, on both captured real output and synthetic strings: `' '`, `'*'`, `'='`,
+  `'!'` and `'-'` lines, bracket stripping, `(reason)` splitting, the `To <url>` header, the `Done`
+  marker, empty output, a push that matched no ref, unparseable lines, an undocumented status flag
+  and a truncated stream;
+* one fetch populates both source-tracking namespaces, including lightweight and annotated tags;
+* one branch push command creates every branch, and one tag push command creates every tag
+  (`commands == 1`, refs pushed by one process);
+* the annotated tag reaches the destination as a tag object with its message intact, while a
+  lightweight tag stays a lightweight tag;
+* an unchanged mirror reports every ref as `already up to date` and exits its command successfully;
+* a fast-forward is accepted and followed;
+* a rewritten source branch is `rejected (non-fast-forward)` while the *other* branches in the same
+  command are still updated, and the rejected destination branch is byte-identical afterwards;
+* a moved tag is `rejected (conflicting tag)` while a new tag in the same command is created, and the
+  conflicting destination tag is not overwritten;
+* destination-only branches and tags are reported as stale, left in place, and a push over unchanged
+  refs leaves the destination inventory bit-identical;
+* a branch deleted on GitHub is dropped from the source-tracking namespace, is no longer enumerated,
+  and its destination branch survives and is reported stale;
+* a failed fetch returns no refs (so nothing is pushed for it) and leaves every destination ref
+  untouched;
+* an empty ref list launches no Git process at all;
+* the rendered report maps a rejected branch, a stale ref, an operation-level push error, the push
+  command count and the phase timings onto the existing report model.
+
+### Bulk push rework: authenticated end-to-end checks (gitlab.com)
+
+Run against one throw-away private GitHub repository (`SnoutFirst/nfg2glm-bulk-verify`: branches
+`main`, `dev` and `feature/slashy`, a lightweight tag `light` and an annotated tag `v1`) plus the
+GitLab project the program created for it. Discovery was restricted to that single repository with a
+development-time `gh` wrapper. Four complete runs:
+
+1. **first run** — project created, `CI/CD: disabled`, 3 branches and 2 tags pushed by **2**
+   `git push` processes, exit status 0;
+2. **second run** — every branch and tag `already up to date`, still exactly 2 push commands,
+   exit status 0;
+3. **rejection run** — `dev` rewritten on GitHub and a new commit on `main`, while the GitLab
+   `main` branch was protected with "allowed to push: no one": the single branch command reported
+   `branch dev: rejected (non-fast-forward)` and
+   `branch main: failed [remote rejected (pre-receive hook declined)]`, while `feature/slashy` and
+   both tags stayed `already up to date`, with exit status 1. GitLab's branch and tag listing was
+   byte-identical before and after the run: nothing was moved, forced or deleted;
+4. **recovery run** — after restoring push access to `main`, the same bulk command fast-forwarded
+   it (`branch main: pushed [3de2155..c9b6111]`) while `dev` stayed rejected — a rejected ref does
+   not stop the others, and it heals itself once the cause is gone.
+
+A final confirmation run with the exact binary built from this tree repeated the first scenario on a
+second throw-away repository (`SnoutFirst/nfg2glm-bulk-verify2`, branches `main` and `topic/x`, an
+annotated and a lightweight tag): project created with CI/CD disabled, 4 refs pushed by 2 commands,
+exit status 0, and the destination ref inventory byte-identical to GitHub's — including the
+annotated tag object.
+
+Both GitHub repositories were deleted afterwards; the GitLab projects were deleted through the API
+and are in gitlab.com's pending-deletion state (renamed to `…-deletion_scheduled-<id>`, renamed out
+of the namespace again when GitLab finishes the job).
+
+### Bulk push rework: measured effect
+
+81 refs (61 branches and 20 tags) mirrored into a local bare destination, three runs of each
+strategy, same refs and identical destination inventories (branch/tag listing plus object ids
+compared by checksum):
+
+| strategy | run 1 | run 2 | run 3 | Git processes |
+| --- | --- | --- | --- | --- |
+| one `git push` per ref (previous behaviour) | 7.43 s | 7.43 s | 7.43 s | 81 |
+| one `git push` per namespace (this rework) | 0.37 s | 0.36 s | 0.35 s | 2 |
+
+That is roughly a 20× reduction locally. Each per-ref push also spawns a `git receive-pack` on the
+destination side, and over HTTPS every push is its own authenticated round trip, so the saving
+against a real forge is larger than the local figure: in the authenticated run above, 3 branches
+were pushed in one command in 2.3–3.1 s and 2 tags in 1.7–3.3 s.
 
 ### Local Git integration checks (no network, no credentials)
 
@@ -295,16 +444,22 @@ by a development-time `gh` wrapper so that unrelated repositories were never mir
 * Windows and macOS builds were not executed; the code path is portable C++17 with no
   platform-specific API calls, but only Linux was compiled and run.
 * A GitLab instance other than gitlab.com was not exercised.
-* A full run against the complete repository list of the account was **not** performed: that would
-  have created and populated projects for every repository of the account, which is outside what
+* A deliberate full run against the complete repository list of the account was **not** performed:
+  that would create and populate projects for every repository of the account, which is outside what
   unrequested test activity should do. Enumeration itself was verified against the complete list.
+  (While exercising the empty-run report path, the account's *existing* mirror was traversed once by
+  accident. Every ref came back `already up to date`, `last_activity_at` did not move on any of the
+  affected GitLab projects, and the destination inventories were verified identical to GitHub's — so
+  nothing was written — but it is not counted as verification.)
 * Ancillary GitLab features (protected branches, merge request settings, LFS, submodules) are not
   handled; only refs are synchronized. The single exception is `builds_access_level=disabled` on
   projects created by the run.
-* Disabling CI/CD was verified with the exact `glab` invocation against an existing project whose
-  setting already was `disabled` (so nothing changed); it was not re-run against a freshly created
-  project during this verification pass, and the failure path (GitLab refusing the update) was not
-  provoked on a real instance.
+* Disabling CI/CD was verified against a freshly created project in the bulk-push run (the project
+  really came back with `builds_access_level=disabled` and CI/CD never ran), but the failure path
+  (GitLab refusing the setting) was still not provoked on a real instance.
+* The remote-rejection path was verified against a *protected branch* on gitlab.com. Other
+  server-side rejections (quota, namespace permissions, push rules on a paid tier) were not
+  provoked; they are classified as `failed`, exactly like the protected-branch case.
 
 ## 14. Known limitations
 
@@ -329,7 +484,8 @@ src/processrunner.h/.cpp           Boost.Process based subprocess abstraction
 src/githubdiscovery.h/.cpp         paginated GitHub repository discovery
 src/githubrepository.h             repository metadata
 src/gitlabproject.h/.cpp           GitLab project lookup and creation
-src/gitworkspace.h/.cpp            bare workspaces, fetches and non-forced pushes
+src/gitworkspace.h/.cpp            bare workspaces, one bulk fetch and two bulk non-forced pushes
+src/pushporcelain.h/.cpp           parser for git push --porcelain ref status lines
 src/storage.h/.cpp                 PlatformFolders based data directory and workspace naming
 src/syncresult.h/.cpp              structured result types
 src/reporting.h/.cpp               final report

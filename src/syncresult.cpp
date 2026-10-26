@@ -42,6 +42,8 @@ std::string describe(RefPushState state) {
       return "rejected (conflicting tag)";
     case RefPushState::failed:
       return "failed";
+    case RefPushState::unreported:
+      return "unknown (git reported no result)";
   }
   return "failed";
 }
@@ -88,6 +90,10 @@ bool RepositoryResult::hasRefFailures() const {
   return branchesFailed() != 0 || tagsFailed() != 0;
 }
 
+bool RepositoryResult::hasPushErrors() const {
+  return !branches.operationError.empty() || !tags.operationError.empty();
+}
+
 namespace {
 
 std::size_t countState(const std::vector<RefPushResult>& refs, RefPushState state) {
@@ -112,13 +118,15 @@ std::size_t countSucceeded(const std::vector<RefPushResult>& refs) {
 
 }  // namespace
 
-std::size_t RepositoryResult::branchesSucceeded() const { return countSucceeded(branches); }
+std::size_t RepositoryResult::branchesSucceeded() const { return countSucceeded(branches.refs); }
 
-std::size_t RepositoryResult::branchesFailed() const { return branches.size() - countSucceeded(branches); }
+std::size_t RepositoryResult::branchesFailed() const {
+  return branches.refs.size() - countSucceeded(branches.refs);
+}
 
-std::size_t RepositoryResult::tagsSucceeded() const { return countSucceeded(tags); }
+std::size_t RepositoryResult::tagsSucceeded() const { return countSucceeded(tags.refs); }
 
-std::size_t RepositoryResult::tagsFailed() const { return tags.size() - countSucceeded(tags); }
+std::size_t RepositoryResult::tagsFailed() const { return tags.refs.size() - countSucceeded(tags.refs); }
 
 std::size_t RunResult::synchronizedRepositories() const {
   std::size_t count = 0;
@@ -191,7 +199,7 @@ std::size_t RunResult::branchesFailed() const {
 std::size_t RunResult::branchesUpToDate() const {
   std::size_t count = 0;
   for (const RepositoryResult& repository : repositories) {
-    count += countState(repository.branches, RefPushState::alreadyUpToDate);
+    count += countState(repository.branches.refs, RefPushState::alreadyUpToDate);
   }
   return count;
 }
@@ -215,7 +223,7 @@ std::size_t RunResult::tagsFailed() const {
 std::size_t RunResult::tagsUpToDate() const {
   std::size_t count = 0;
   for (const RepositoryResult& repository : repositories) {
-    count += countState(repository.tags, RefPushState::alreadyUpToDate);
+    count += countState(repository.tags.refs, RefPushState::alreadyUpToDate);
   }
   return count;
 }

@@ -29,9 +29,13 @@ class GitWorkspace {
   FetchResult fetchAll(const GitHubRepository& repository,
                        const std::filesystem::path& repositoryPath) const;
 
-  /// Push one branch or tag without force, and classify the outcome.
-  RefPushResult push(const std::filesystem::path& repositoryPath, RefKind kind,
-                     const std::string& name) const;
+  /// Push every branch or every tag of the source-tracking namespace in a single Git process.
+  ///
+  /// One wildcard refspec maps the whole namespace, so the cost does not grow with the number
+  /// of refs. The refspec is passed as one literal argument; Git expands the wildcard itself.
+  /// Branches and tags are pushed separately so their results can be classified independently.
+  BulkPushResult pushAll(const std::filesystem::path& repositoryPath, RefKind kind,
+                         const std::vector<std::string>& names) const;
 
   /// Destination refs that have no corresponding source ref. They are reported, never removed.
   std::vector<std::string> staleDestinationRefs(const std::filesystem::path& repositoryPath,

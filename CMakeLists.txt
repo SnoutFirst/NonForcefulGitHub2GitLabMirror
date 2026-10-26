@@ -40,6 +40,7 @@ add_executable(NonForcefulGitHub2GitLabMirror
   src/gitworkspace.cpp
   src/nonforcefulgithub2gitlabmirror.cpp
   src/processrunner.cpp
+  src/pushporcelain.cpp
   src/reporting.cpp
   src/storage.cpp
   src/syncresult.cpp

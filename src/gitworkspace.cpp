@@ -1,12 +1,14 @@
 #include "gitworkspace.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <system_error>
 
+#include "pushporcelain.h"
 #include "textutil.h"
 
 namespace nfg2glm {
@@ -21,8 +23,17 @@ constexpr const char* destinationBranchPrefix = "refs/heads/";
 constexpr const char* destinationTagPrefix = "refs/tags/";
 constexpr const char* branchRefspec = "+refs/heads/*:refs/nonforceful-github/heads/*";
 constexpr const char* tagRefspec = "+refs/tags/*:refs/nonforceful-github/tags/*";
+// Push refspecs carry no leading '+': these destinations must never be forced.
+constexpr const char* branchPushRefspec = "refs/nonforceful-github/heads/*:refs/heads/*";
+constexpr const char* tagPushRefspec = "refs/nonforceful-github/tags/*:refs/tags/*";
 constexpr const char* sourceRepositoryConfigKey = "nfg2glm.sourcerepository";
 constexpr const char* gitlabProjectConfigKey = "nfg2glm.gitlabproject";
+
+double elapsedMilliseconds(const std::chrono::steady_clock::time_point& started) {
+  const std::chrono::duration<double, std::milli> elapsed =
+      std::chrono::steady_clock::now() - started;
+  return elapsed.count();
+}
 
 std::string trackingRef(RefKind kind, const std::string& name) {
   return (kind == RefKind::branch ? trackingBranchPrefix : trackingTagPrefix) + name;
@@ -55,7 +66,8 @@ bool remoteMatchesRepository(const std::string& url, const GitHubRepository& rep
   return equalsIgnoreCase(remoteRepositorySuffix(url), repository.fullName);
 }
 
-/// A push argument list must never contain a destructive or forced option.
+/// A push argument list must never contain a destructive or forced option, and never a
+/// refspec that asks Git to force the destination.
 void ensureNonForcedArguments(const std::vector<std::string>& arguments) {
   for (const std::string& argument : arguments) {
     const bool forbidden = argument == "-f" || argument == "--force" ||
@@ -66,6 +78,10 @@ void ensureNonForcedArguments(const std::vector<std::string>& arguments) {
                            argument == "--tags" || argument == "--all";
     if (forbidden) {
       throw std::logic_error("refusing to run a destructive git push: " + argument);
+    }
+    // A leading '+' in a refspec is the short spelling of --force.
+    if (!argument.empty() && argument.front() == '+') {
+      throw std::logic_error("refusing to run a forced git push: " + argument);
     }
   }
 }
@@ -81,6 +97,18 @@ RefPushState classifyRejection(const std::string& detail, RefKind kind) {
     return RefPushState::rejectedTagConflict;
   }
   return RefPushState::failed;
+}
+
+/// The human-readable summary of one porcelain entry, for the per-ref report line.
+std::string pushDetail(const PushPorcelainEntry& entry) {
+  std::string detail = entry.summary;
+  if (!entry.reason.empty()) {
+    detail += " (" + entry.reason + ")";
+  }
+  if (detail.empty()) {
+    detail = "git reported no summary";
+  }
+  return detail;
 }
 
 }  // namespace
@@ -334,69 +362,120 @@ FetchResult GitWorkspace::fetchAll(const GitHubRepository& repository,
   return result;
 }
 
-RefPushResult GitWorkspace::push(const std::filesystem::path& repositoryPath, RefKind kind,
-                                 const std::string& name) const {
-  RefPushResult result;
-  result.name = name;
-  result.kind = kind;
+BulkPushResult GitWorkspace::pushAll(const std::filesystem::path& repositoryPath, RefKind kind,
+                                     const std::vector<std::string>& names) const {
+  BulkPushResult result;
+  std::map<std::string, std::size_t> indexByDestinationRef;
+  for (const std::string& name : names) {
+    RefPushResult ref;
+    ref.name = name;
+    ref.kind = kind;
+    ref.state = RefPushState::unreported;
+    ref.detail = "git reported no result for this ref";
+    indexByDestinationRef.emplace(destinationRef(kind, name), result.refs.size());
+    result.refs.push_back(std::move(ref));
+  }
+  if (result.refs.empty()) {
+    // Nothing to push: no process is launched at all.
+    return result;
+  }
 
-  const std::string source = trackingRef(kind, name);
-  const std::string destination = destinationRef(kind, name);
-  const std::string refspec = source + ":" + destination;
+  const std::string refspec = kind == RefKind::branch ? branchPushRefspec : tagPushRefspec;
   std::vector<std::string> arguments = credentialArguments(true);
   arguments.insert(arguments.end(), {"push", "--porcelain", destinationRemote, refspec});
   ensureNonForcedArguments(arguments);
 
+  const auto started = std::chrono::steady_clock::now();
   const ProcessResult response = runner_.run(gitExecutable_, arguments, repositoryPath);
+  result.durationMs = elapsedMilliseconds(started);
+  result.exitCode = response.launched ? response.exitCode : -1;
+  ++result.commands;
+
+  std::vector<std::string> errors;
   if (!response.launched) {
-    result.detail = response.launchError;
+    errors.push_back("the git push process could not be started: " + response.launchError);
+    result.operationError = join(errors, "; ");
     return result;
   }
 
-  for (const std::string& line : splitLines(response.standardOutput)) {
-    if (line.size() < 2) {
+  const PushPorcelainParse parsed = parsePushPorcelain(response.standardOutput);
+  for (const PushPorcelainEntry& entry : parsed.entries) {
+    const auto found = indexByDestinationRef.find(entry.to);
+    if (found == indexByDestinationRef.end()) {
+      // Porcelain output for a ref that was not requested: never invent an outcome for it.
       continue;
     }
-    const std::vector<std::string> fields = split(line, '\t');
-    if (fields.size() < 2 || fields[0].size() != 1 || fields[1] != refspec) {
-      continue;
+    RefPushResult& ref = result.refs[found->second];
+    ref.detail = pushDetail(entry);
+    if (!entry.from.empty() && entry.from != trackingRef(kind, ref.name)) {
+      ref.detail += " (git reported the source ref '" + entry.from + "')";
     }
-    std::string summary = fields.size() > 2 ? trim(fields[2]) : std::string();
-    if (summary.size() >= 2 && summary.front() == '[' && summary.back() == ']') {
-      summary = summary.substr(1, summary.size() - 2);
-    }
-    switch (fields[0][0]) {
+    switch (entry.flag) {
       case '=':
-        result.state = RefPushState::alreadyUpToDate;
+        ref.state = RefPushState::alreadyUpToDate;
         break;
-      case '*':
-      case '+':
       case ' ':
-        result.state = RefPushState::pushed;
+      case '*':
+        ref.state = RefPushState::pushed;
+        break;
+      case '+':
+        // A forced update is never requested by this program, so it must not go unnoticed.
+        ref.state = RefPushState::pushed;
+        ref.detail = "forced update (not requested by this program): " + ref.detail;
+        errors.push_back("`git push` reported a forced update for " + entry.to);
         break;
       case '!':
-        result.state = classifyRejection(summary, kind);
+        ref.state = classifyRejection(entry.summary + " " + entry.reason, kind);
         break;
       case '-':
-        result.detail = "the destination ref was unexpectedly deleted";
-        result.state = RefPushState::failed;
+        ref.state = RefPushState::failed;
+        ref.detail = "git reported the destination ref as deleted: " + ref.detail;
+        errors.push_back("`git push` deleted " + entry.to + ", which was never requested");
         break;
       default:
-        continue;
+        ref.state = RefPushState::unreported;
+        ref.detail = "unrecognised git push status '" + std::string(1, entry.flag) + "': " +
+                     ref.detail;
+        break;
     }
-    result.detail = summary;
-    return result;
   }
 
-  if (response.exitCode == 0) {
-    result.state = RefPushState::alreadyUpToDate;
-    result.detail = "no change reported by git";
-    return result;
+  if (!parsed.malformedLines.empty()) {
+    errors.push_back("`git push` printed " + std::to_string(parsed.malformedLines.size()) +
+                     " line(s) that are not in the documented porcelain format (first: '" +
+                     parsed.malformedLines.front() + "')");
+  }
+  if (!parsed.unexpectedStatuses.empty()) {
+    errors.push_back("`git push` printed " +
+                     std::to_string(parsed.unexpectedStatuses.size()) +
+                     " ref line(s) with an undocumented status (first: '" +
+                     parsed.unexpectedStatuses.front() + "')");
+  }
+  if (!parsed.complete() && (!parsed.entries.empty() || response.exitCode == 0)) {
+    errors.push_back("the `git push` output ended without its final 'Done' line, so the "
+                     "per-ref results may be incomplete");
   }
 
-  const std::string diagnostic = response.diagnostic();
-  result.state = classifyRejection(diagnostic, kind);
-  result.detail = diagnostic;
+  std::size_t unreported = 0;
+  for (const RefPushResult& ref : result.refs) {
+    if (ref.state == RefPushState::unreported) {
+      ++unreported;
+    }
+  }
+  if (response.succeeded()) {
+    if (unreported != 0) {
+      errors.push_back("`git push` exited successfully but reported no result for " +
+                       std::to_string(unreported) + " ref(s), whose outcome is therefore unknown");
+    }
+  } else if (parsed.entries.empty()) {
+    errors.push_back("`git push` failed before reporting any ref: " + response.diagnostic());
+  } else if (unreported != 0) {
+    errors.push_back("`git push` exited with status " + std::to_string(response.exitCode) +
+                     " and reported no result for " + std::to_string(unreported) +
+                     " ref(s), whose outcome is therefore unknown");
+  }
+
+  result.operationError = join(errors, "; ");
   return result;
 }
 

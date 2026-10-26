@@ -1,5 +1,7 @@
 #include "reporting.h"
 
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 namespace nfg2glm {
@@ -13,6 +15,80 @@ void printRefs(std::ostream& stream, const std::vector<RefPushResult>& refs) {
     }
     stream << '\n';
   }
+}
+
+/// A bulk push command that failed as a whole is reported next to the per-ref lines, never
+/// instead of them: the refs Git did update keep their successful state.
+void printPushError(std::ostream& stream, RefKind kind, const std::string& error) {
+  if (error.empty()) {
+    return;
+  }
+  stream << "  " << describe(kind) << " push failed [" << error << "]\n";
+}
+
+std::string milliseconds(double value) {
+  std::ostringstream formatted;
+  formatted << std::fixed << std::setprecision(1) << value;
+  return formatted.str();
+}
+
+double totalMilliseconds(const RunResult& result, double PhaseTimings::*member) {
+  double total = 0.0;
+  for (const RepositoryResult& repository : result.repositories) {
+    total += repository.timings.*member;
+  }
+  return total;
+}
+
+std::size_t countFetchAttempts(const RunResult& result) {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : result.repositories) {
+    if (repository.fetch.ok() || !repository.fetch.error.empty()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t countDestinationListings(const RunResult& result) {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : result.repositories) {
+    if (repository.fetch.ok()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t countLocalRepositorySetups(const RunResult& result) {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : result.repositories) {
+    if (!repository.localRepository.path.empty()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t countPushCommands(const RunResult& result, RefKind kind) {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : result.repositories) {
+    count += kind == RefKind::branch ? repository.branches.commands : repository.tags.commands;
+  }
+  return count;
+}
+
+std::size_t countPushCommands(const RunResult& result) {
+  return countPushCommands(result, RefKind::branch) + countPushCommands(result, RefKind::tag);
+}
+
+std::size_t countPushedRefs(const RunResult& result, RefKind kind) {
+  std::size_t count = 0;
+  for (const RepositoryResult& repository : result.repositories) {
+    count += (kind == RefKind::branch ? repository.branches.refs.size()
+                                      : repository.tags.refs.size());
+  }
+  return count;
 }
 
 }  // namespace
@@ -60,8 +136,10 @@ void printRepositoryReport(std::ostream& stream, const RepositoryResult& result)
     stream << "  fetch: failed [" << result.fetch.error << "]\n";
   }
 
-  printRefs(stream, result.branches);
-  printRefs(stream, result.tags);
+  printPushError(stream, RefKind::branch, result.branches.operationError);
+  printRefs(stream, result.branches.refs);
+  printPushError(stream, RefKind::tag, result.tags.operationError);
+  printRefs(stream, result.tags.refs);
 
   if (!result.staleDestinationRefs.empty()) {
     stream << "  stale destination refs (left untouched): ";
@@ -110,6 +188,9 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
   stream << "Tags pushed successfully: " << result.tagsSucceeded() << " (already up to date: "
          << result.tagsUpToDate() << ")\n";
   stream << "Tag conflicts/failures: " << result.tagsFailed() << '\n';
+  stream << "Git push commands: " << countPushCommands(result) << " (branches: "
+         << countPushCommands(result, RefKind::branch) << ", tags: "
+         << countPushCommands(result, RefKind::tag) << ")\n";
   stream << "Name collisions: " << result.collisions() << '\n';
 
   stream << "\nRepository details\n------------------\n";
@@ -121,6 +202,31 @@ void printRunReport(std::ostream& stream, const RunResult& result) {
     printRepositoryReport(stream, repository);
     stream << '\n';
   }
+}
+
+void printRunTimings(std::ostream& stream, const RunResult& result) {
+  stream << "\nPhase timings\n-------------\n";
+  stream << "Repository discovery:            " << milliseconds(result.discoveryMs) << " ms\n";
+  stream << "Local repository setup:          "
+         << milliseconds(totalMilliseconds(result, &PhaseTimings::localRepositoryMs)) << " ms ("
+         << countLocalRepositorySetups(result) << " workspace(s))\n";
+  stream << "Source fetch:                    "
+         << milliseconds(totalMilliseconds(result, &PhaseTimings::fetchMs)) << " ms ("
+         << countFetchAttempts(result) << " fetch command(s), one per repository)\n";
+  stream << "Destination ref listing:         "
+         << milliseconds(totalMilliseconds(result, &PhaseTimings::destinationListingMs))
+         << " ms (" << countDestinationListings(result) << " listing(s))\n";
+  stream << "Bulk branch push:                "
+         << milliseconds(totalMilliseconds(result, &PhaseTimings::branchPushMs)) << " ms ("
+         << countPushCommands(result, RefKind::branch) << " command(s) for "
+         << countPushedRefs(result, RefKind::branch) << " branch(es))\n";
+  stream << "Bulk tag push:                   "
+         << milliseconds(totalMilliseconds(result, &PhaseTimings::tagPushMs)) << " ms ("
+         << countPushCommands(result, RefKind::tag) << " command(s) for "
+         << countPushedRefs(result, RefKind::tag) << " tag(s))\n";
+  stream << "Report generation:               " << milliseconds(result.reportGenerationMs)
+         << " ms\n";
+  stream << "Total before report generation:  " << milliseconds(result.elapsedMs) << " ms\n";
 }
 
 }  // namespace nfg2glm

@@ -34,7 +34,8 @@ enum class RefPushState {
   alreadyUpToDate,         ///< The destination already pointed at the same object.
   rejectedNonFastForward,  ///< Git refused a divergent branch update.
   rejectedTagConflict,     ///< Git refused to move an existing tag to a different object.
-  failed                   ///< Any other failure (permissions, transport, server error).
+  failed,                  ///< Any other failure (permissions, transport, server error).
+  unreported               ///< Git printed no result for this ref, so its outcome is unknown.
 };
 
 std::string describe(RefPushState state);
@@ -48,6 +49,26 @@ struct RefPushResult {
   bool succeeded() const {
     return state == RefPushState::pushed || state == RefPushState::alreadyUpToDate;
   }
+};
+
+/// Outcome of one bulk push command that carried every branch (or every tag) at once.
+///
+/// The operation-level fields are deliberately separate from the per-ref states: a push
+/// process that exits non-zero because Git rejected one ref still reports the refs it did
+/// update, and those keep their successful state.
+struct BulkPushResult {
+  /// One entry per requested ref, in the order the refs were requested.
+  std::vector<RefPushResult> refs;
+  /// Number of Git push processes this operation needed (0 or 1).
+  std::size_t commands = 0;
+  /// Exit status of the push process, captured separately from its output (-1 when the
+  /// process could not be started). A non-zero status does not mean every ref failed.
+  int exitCode = -1;
+  /// Operation-level diagnostic when the command itself failed or its output was not
+  /// trustworthy. Empty when the command ran and every ref line was parsed.
+  std::string operationError;
+  /// Wall-clock cost of the push command, in milliseconds.
+  double durationMs = 0.0;
 };
 
 enum class LocalRepositoryState { created, reused, invalid };
@@ -108,20 +129,31 @@ enum class RepositoryState {
 
 std::string describe(RepositoryState state);
 
+/// Wall-clock cost of one repository's synchronization phases, in milliseconds.
+struct PhaseTimings {
+  double localRepositoryMs = 0.0;
+  double fetchMs = 0.0;
+  double destinationListingMs = 0.0;
+  double branchPushMs = 0.0;
+  double tagPushMs = 0.0;
+};
+
 struct RepositoryResult {
   GitHubRepository repository;
   RepositoryState state = RepositoryState::failed;
   ProjectResult project;
   LocalRepositoryResult localRepository;
   FetchResult fetch;
-  std::vector<RefPushResult> branches;
-  std::vector<RefPushResult> tags;
+  BulkPushResult branches;
+  BulkPushResult tags;
   std::vector<std::string> staleDestinationRefs;
   std::vector<std::string> notes;
+  PhaseTimings timings;
   std::string error;
   ErrorCategory category = ErrorCategory::none;
 
   bool hasRefFailures() const;
+  bool hasPushErrors() const;
   std::size_t branchesSucceeded() const;
   std::size_t branchesFailed() const;
   std::size_t tagsSucceeded() const;
@@ -133,6 +165,9 @@ struct RunResult {
   bool discoveryComplete = true;
   std::string discoveryError;
   std::vector<RepositoryResult> repositories;
+  double discoveryMs = 0.0;
+  double reportGenerationMs = 0.0;
+  double elapsedMs = 0.0;
 
   std::size_t discoveredRepositories() const { return repositories.size(); }
   std::size_t synchronizedRepositories() const;

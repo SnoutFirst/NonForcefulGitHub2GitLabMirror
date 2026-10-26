@@ -1,14 +1,38 @@
 #include "nonforcefulgithub2gitlabmirror.h"
 
+#include <chrono>
 #include <exception>
 #include <iostream>
+#include <sstream>
 
 #include "reporting.h"
 #include "textutil.h"
 
 namespace nfg2glm {
+namespace {
+
+double elapsedMilliseconds(const std::chrono::steady_clock::time_point& started) {
+  const std::chrono::duration<double, std::milli> elapsed =
+      std::chrono::steady_clock::now() - started;
+  return elapsed.count();
+}
+
+}  // namespace
 
 int NonForcefulGitHub2GitLabMirror::run() {
+  const auto runStarted = std::chrono::steady_clock::now();
+
+  // Rendering the report is measured separately, so the report can state its own cost.
+  const auto emitReport = [this, &runStarted]() {
+    result_.elapsedMs = elapsedMilliseconds(runStarted);
+    const auto reportStarted = std::chrono::steady_clock::now();
+    std::ostringstream body;
+    printRunReport(body, result_);
+    result_.reportGenerationMs = elapsedMilliseconds(reportStarted);
+    std::cout << body.str();
+    printRunTimings(std::cout, result_);
+  };
+
   std::cout << "NonForcefulGitHub2GitLabMirror\n"
             << "One-way GitHub to GitLab mirror. Destination refs are never forced, "
                "overwritten or deleted.\n\n";
@@ -25,13 +49,15 @@ int NonForcefulGitHub2GitLabMirror::run() {
   }
 
   std::cout << "\nDiscovering GitHub repositories...\n";
+  const auto discoveryStarted = std::chrono::steady_clock::now();
   const DiscoveryResult discovery = discovery_->discover();
+  result_.discoveryMs = elapsedMilliseconds(discoveryStarted);
   if (!discovery.ok) {
     result_.discoveryComplete = false;
     result_.discoveryError = discovery.error;
     std::cout << "Repository discovery failed: " << discovery.error << "\n";
     std::cout << "No repository was synchronized.\n";
-    printRunReport(std::cout, result_);
+    emitReport();
     return 1;
   }
   if (!discovery.complete) {
@@ -44,7 +70,7 @@ int NonForcefulGitHub2GitLabMirror::run() {
             << discovery.malformedEntries << " unusable entries skipped).\n\n";
 
   synchronize(discovery.repositories);
-  printRunReport(std::cout, result_);
+  emitReport();
 
   if (!result_.successful()) {
     std::cout << "\nResult: FAILED (see the report above)\n";
@@ -122,9 +148,9 @@ void NonForcefulGitHub2GitLabMirror::synchronize(
               << " (" << repository.visibility << ")\n";
 
     RepositoryResult result = synchronizeRepository(repository);
-    std::cout << "    -> " << describe(result.state) << ": " << result.branchesSucceeded()
-              << '/' << result.branches.size() << " branch(es), " << result.tagsSucceeded() << '/'
-              << result.tags.size() << " tag(s)";
+    std::cout << "    -> " << describe(result.state) << ": " << result.branchesSucceeded() << '/'
+              << result.branches.refs.size() << " branch(es), " << result.tagsSucceeded() << '/'
+              << result.tags.refs.size() << " tag(s)";
     if (!result.error.empty()) {
       std::cout << " -- " << result.error;
     }
@@ -164,8 +190,10 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
     }
 
     const std::filesystem::path repositoryPath = storage_->repositoryPath(repository);
+    auto phaseStarted = std::chrono::steady_clock::now();
     result.localRepository =
         workspace_->prepare(repository, repositoryPath, result.project.httpUrlToRepo);
+    result.timings.localRepositoryMs = elapsedMilliseconds(phaseStarted);
     if (!result.localRepository.ok()) {
       result.state = RepositoryState::skipped;
       result.category = result.localRepository.category;
@@ -173,7 +201,9 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
       return result;
     }
 
+    phaseStarted = std::chrono::steady_clock::now();
     result.fetch = workspace_->fetchAll(repository, repositoryPath);
+    result.timings.fetchMs = elapsedMilliseconds(phaseStarted);
     if (!result.fetch.ok()) {
       result.state = RepositoryState::failed;
       result.category = result.fetch.category;
@@ -181,17 +211,20 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
       return result;
     }
 
-    for (const std::string& branch : result.fetch.branches) {
-      result.branches.push_back(workspace_->push(repositoryPath, RefKind::branch, branch));
-    }
-    for (const std::string& tag : result.fetch.tags) {
-      result.tags.push_back(workspace_->push(repositoryPath, RefKind::tag, tag));
-    }
+    // One push process for all branches, one for all tags: the wildcard refspec maps the whole
+    // source-tracking namespace, so the number of refs does not multiply the number of commands.
+    result.branches = workspace_->pushAll(repositoryPath, RefKind::branch, result.fetch.branches);
+    result.timings.branchPushMs = result.branches.durationMs;
 
+    result.tags = workspace_->pushAll(repositoryPath, RefKind::tag, result.fetch.tags);
+    result.timings.tagPushMs = result.tags.durationMs;
+
+    phaseStarted = std::chrono::steady_clock::now();
     result.staleDestinationRefs = workspace_->staleDestinationRefs(repositoryPath, result.fetch);
+    result.timings.destinationListingMs = elapsedMilliseconds(phaseStarted);
 
     const bool fullySynchronized = result.project.visibilityMatchesRequirement &&
-                                   !result.hasRefFailures();
+                                   !result.hasRefFailures() && !result.hasPushErrors();
     result.state = fullySynchronized ? RepositoryState::synchronized
                                      : RepositoryState::completedWithFailures;
     if (!fullySynchronized && result.error.empty()) {
@@ -199,6 +232,10 @@ RepositoryResult NonForcefulGitHub2GitLabMirror::synchronizeRepository(
         result.category = ErrorCategory::gitCommand;
         result.error =
             "at least one destination ref was rejected or failed; it was left as GitLab had it";
+      } else if (result.hasPushErrors()) {
+        result.category = ErrorCategory::gitCommand;
+        result.error = "a bulk git push command did not complete cleanly; only the refs listed "
+                       "above are known to be in place";
       } else {
         result.category = ErrorCategory::gitlabProject;
         result.error = "the GitLab project exists with a visibility that differs from the "
